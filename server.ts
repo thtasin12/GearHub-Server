@@ -1,8 +1,19 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { MongoClient } from "mongodb";
 
 dotenv.config();
+
+const env = {
+  PORT: Number(process.env.PORT ?? 5000),
+
+  MONGODB_URI:
+    process.env.MONGODB_URI ?? "mongodb://127.0.0.1:27017",
+
+  MONGODB_DB_NAME:
+    process.env.MONGODB_DB_NAME ?? "gearhub",
+};
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -16,6 +27,10 @@ app.use(
 );
 
 app.use(express.json());
+
+const mongoClient = new MongoClient(env.MONGODB_URI, {
+  serverSelectionTimeoutMS: 15000
+})
 
 
 app.get("/", (req, res) => {
