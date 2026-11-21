@@ -16,7 +16,6 @@ const env = {
 };
 
 const app = express();
-const PORT = process.env.PORT || 5000;
 
 //Middleware
 app.use(
@@ -26,7 +25,6 @@ app.use(
   })
 );
 
-app.use(express.json());
 
 const mongoClient = new MongoClient(env.MONGODB_URI, {
   serverSelectionTimeoutMS: 15000
@@ -42,6 +40,6 @@ app.get("/", (req, res) => {
 
 
 
-app.listen(PORT, () => {
-  console.log(`Server: http://localhost:${PORT}`);
+app.listen(env.PORT, () => {
+  console.log(`Server: http://localhost:${env.PORT}`);
 });
