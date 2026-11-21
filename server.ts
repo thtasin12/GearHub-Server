@@ -1,9 +1,41 @@
-import express from "express";
+import express, { type Request } from "express";
 import cors, { type CorsOptions } from "cors";
 import dotenv from "dotenv";
-import { MongoClient } from "mongodb";
+import { MongoClient, type Db } from "mongodb";
 import helmet from "helmet"
 import rateLimit from "express-rate-limit"
+
+let db: Db
+
+
+type Role = "customer" | "owner" | "admin";
+
+type AuthUser = {
+  id: string;
+  email: string;
+  name: string;
+  role: Role;
+  image?: string;
+}
+
+type AuthRequest = Request & {
+  authUser?: AuthUser;
+}
+
+type AnyDoc = Record<string, any>
+
+type RentalType = "daily" | "weekly" | "monthly"
+
+type EquipmentStatus = "pending" | "approved" | "rejected"
+
+type BookingStatus =
+  | "pending_payment"
+  | "confirmed"
+  | "in_progress"
+  | "completed"
+  | "cancelled"
+  | "expired"
+  | "payment_failed"
 
 dotenv.config();
 
