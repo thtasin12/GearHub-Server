@@ -326,9 +326,12 @@ const env = {
     .map((v) => v.trim())
     .filter(Boolean),
 
+  BETTER_AUTH_SECRET: process.env.BETTER_AUTH_SECRET ?? "",
   BETTER_AUTH_URL: (
     process.env.BETTER_AUTH_URL ?? "http://localhost:5000"
   ).replace(/\/$/, ""),
+  GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID ?? "",
+  GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET ?? "",
 };
 
 if (env.BETTER_AUTH_SECRET.length < 32) {
