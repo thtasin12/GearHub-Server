@@ -1,4 +1,9 @@
-import express, { type Request } from "express";
+import express, {
+  type NextFunction,
+  type Request,
+  type Response,
+  type RequestHandler,
+} from "express"
 import cors, { type CorsOptions } from "cors";
 import dotenv from "dotenv";
 import { MongoClient, type Db } from "mongodb";
@@ -36,6 +41,51 @@ type BookingStatus =
   | "cancelled"
   | "expired"
   | "payment_failed"
+
+
+class AppError extends Error {
+  statusCode: number;
+  code?: string;
+
+  constructor(message: string, statusCode = 400, code?: string) {
+    super(message);
+    this.statusCode = statusCode;
+
+    if (code !== undefined) {
+      this.code = code;
+    }
+  }
+}
+
+const asyncHandler = (
+  fn: (
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ) => Promise<unknown> | unknown
+): RequestHandler =>
+  (req, res, next) =>
+    Promise.resolve(fn(req, res, next)).catch(next);
+
+const send = (
+  res: Response,
+  data: unknown,
+  message = "Success",
+  status = 200
+) =>
+  res.status(status).json({
+    success: true,
+    message,
+    data,
+  })
+
+const fail = (
+  message: string,
+  status = 400,
+  code?: string
+): never => {
+  throw new AppError(message, status, code);
+}
 
 dotenv.config();
 
