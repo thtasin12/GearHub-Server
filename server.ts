@@ -6,11 +6,17 @@ import express, {
 } from "express"
 import cors, { type CorsOptions } from "cors";
 import dotenv from "dotenv";
-import { MongoClient, type Db } from "mongodb";
+import {
+  MongoClient,
+  ObjectId,
+  type Db,
+  type Collection,
+  type Document,
+} from "mongodb";
 import helmet from "helmet"
 import rateLimit from "express-rate-limit"
 
-let db: Db
+let db!: Db;
 
 
 type Role = "customer" | "owner" | "admin";
@@ -56,6 +62,56 @@ class AppError extends Error {
     }
   }
 }
+
+
+const asObjectId = (value: string, label = "id"): ObjectId => {
+  if (!ObjectId.isValid(value)) {
+    fail(`Invalid ${label}.`, 400, "INVALID_ID");
+  }
+
+  return new ObjectId(value);
+};
+
+const escapeRegex = (value: string) =>
+  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const cleanText = (value: unknown, max = 2000) =>
+  String(value ?? "").trim().slice(0, max);
+
+const now = () => new Date();
+
+const addMinutes = (date: Date, minutes: number) =>
+  new Date(date.getTime() + minutes * 60_000);
+
+const isRole = (value: unknown): value is Role =>
+  value === "customer" || value === "owner" || value === "admin";
+
+const isValidDate = (value: unknown): value is string =>
+  typeof value === "string" && !Number.isNaN(Date.parse(value));
+
+const toDate = (value: string, field: string) => {
+  if (!isValidDate(value)) {
+    fail(`${field} must be a valid ISO date.`, 400, "INVALID_DATE");
+  }
+
+  return new Date(value);
+};
+
+const getCollection = <T extends Document = AnyDoc>(
+  name: string
+): Collection<T> => db.collection<T>(name);
+
+const userCollection = () => getCollection("user")
+const equipmentCollection = () => getCollection("equipment")
+const bookingsCollection = () => getCollection("bookings")
+const paymentsCollection = () => getCollection("payments")
+const favoritesCollection = () => getCollection("favorites")
+const reviewsCollection = () => getCollection("reviews")
+const notificationsCollection = () => getCollection("notifications")
+const conversationsCollection = () => getCollection("conversations")
+const messagesCollection = () => getCollection("messages")
+const handoversCollection = () => getCollection("handovers")
+const extensionsCollection = () => getCollection("extensions")
 
 const asyncHandler = (
   fn: (
