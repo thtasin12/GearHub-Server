@@ -16,6 +16,17 @@ import {
 import helmet from "helmet"
 import rateLimit from "express-rate-limit"
 
+import { betterAuth } from "better-auth"
+import { mongodbAdapter } from "@better-auth/mongo-adapter"
+import { jwt } from "better-auth/plugins"
+import { APIError, createAuthMiddleware } from "better-auth/api"
+import { toNodeHandler } from "better-auth/node"
+import {
+  createRemoteJWKSet,
+  jwtVerify,
+  type JWTPayload,
+} from "jose"
+
 let db!: Db;
 
 
@@ -61,6 +72,158 @@ class AppError extends Error {
       this.code = code;
     }
   }
+}
+
+
+async function initializeAuth() {
+  const googleConfigured = Boolean(
+    env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET
+  );
+
+  auth = betterAuth({
+    database: /^(mongodb\+srv:|mongodb:.*[?&]replicaSet=)/i.test(
+      env.MONGODB_URI
+    )
+      ? mongodbAdapter(db, { client: mongoClient })
+      : mongodbAdapter(db),
+
+    baseURL: env.BETTER_AUTH_URL,
+    secret: env.BETTER_AUTH_SECRET,
+    trustedOrigins: [...allowedOrigins],
+
+    emailAndPassword: {
+      enabled: true,
+      minPasswordLength: 6,
+      maxPasswordLength: 128,
+    },
+
+    ...(googleConfigured
+      ? {
+        socialProviders: {
+          google: {
+            clientId: env.GOOGLE_CLIENT_ID,
+            clientSecret: env.GOOGLE_CLIENT_SECRET,
+          },
+        },
+      }
+      : {}),
+
+    user: {
+      additionalFields: {
+        role: {
+          type: "string",
+          required: false,
+          defaultValue: "customer",
+          input: false,
+        },
+        phone: {
+          type: "string",
+          required: false,
+          input: false,
+        },
+        address: {
+          type: "string",
+          required: false,
+          input: false,
+        },
+        isBlocked: {
+          type: "boolean",
+          required: false,
+          defaultValue: false,
+          input: false,
+        },
+      },
+    },
+
+    databaseHooks: {
+      user: {
+        create: {
+          before: async (user) => ({
+            data: {
+              ...user,
+              role: "customer",
+              isBlocked: false,
+            },
+          }),
+        },
+      },
+    },
+
+    hooks: {
+      before: createAuthMiddleware(async (ctx) => {
+        if (ctx.path === "/sign-up/email") {
+          const body = ctx.body as
+            | { password?: unknown }
+            | undefined
+
+          const password =
+            typeof body?.password === "string"
+              ? body.password
+              : ""
+
+          if (
+            password.length < 6 ||
+            !/[A-Z]/.test(password) ||
+            !/[a-z]/.test(password)
+          ) {
+            throw new APIError("BAD_REQUEST", {
+              message:
+                "Password must contain an uppercase letter, a lowercase letter, and at least 6 characters.",
+            })
+          }
+        }
+      }),
+    },
+
+    plugins: [
+      jwt({
+        jwt: {
+          expirationTime: "15m",
+          definePayload: ({ user }) => {
+            const customUser = user as typeof user & {
+              role?: string;
+            };
+
+            return {
+              email: user.email,
+              name: user.name,
+              role: customUser.role ?? "customer",
+            };
+          },
+        },
+        jwks: {
+          rotationInterval: 60 * 60 * 24 * 30,
+          gracePeriod: 60 * 60 * 24 * 30,
+        },
+      }),
+    ],
+
+    advanced: {
+      defaultCookieAttributes: {
+        httpOnly: true,
+        secure: env.NODE_ENV === "production",
+        sameSite:
+          env.NODE_ENV === "production" ? "none" : "lax",
+      },
+    },
+
+    rateLimit: {
+      enabled: true,
+      window: 60,
+      max: 100,
+    },
+
+
+  }) as unknown as ReturnType<typeof betterAuth>;
+
+  JWKS = createRemoteJWKSet(
+    new URL(`${env.BETTER_AUTH_URL}/api/auth/jwks`)
+  );
+
+  betterAuthHandler = toNodeHandler(auth) as unknown as (
+    req: Request,
+    res: Response
+  ) => void
 }
 
 
@@ -162,7 +325,15 @@ const env = {
     .split(",")
     .map((v) => v.trim())
     .filter(Boolean),
+
+  BETTER_AUTH_URL: (
+    process.env.BETTER_AUTH_URL ?? "http://localhost:5000"
+  ).replace(/\/$/, ""),
 };
+
+if (env.BETTER_AUTH_SECRET.length < 32) {
+  throw new Error("BETTER_AUTH_SECRET must be at least 32 characters. Set it in .env.");
+}
 
 const app = express();
 
@@ -222,7 +393,16 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-app.use("/api", apiLimiter);
+app.use("/api", apiLimiter)
+
+let auth: ReturnType<typeof betterAuth> = undefined as any;
+
+let betterAuthHandler:
+  | ((req: Request, res: Response) => void)
+  | undefined;
+
+
+let JWKS: ReturnType<typeof createRemoteJWKSet> = undefined as any
 
 
 const mongoClient = new MongoClient(env.MONGODB_URI, {
