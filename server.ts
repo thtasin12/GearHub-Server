@@ -3708,6 +3708,479 @@ app.patch("/api/admin/users/:id/block", verifyToken, verifyAdmin, asyncHandler(a
   )
 }))
 
+app.get("/api/admin/equipment", verifyToken, verifyAdmin, asyncHandler(async (req, res) => {
+
+  const rawStatus: unknown = req.query.status
+
+  const status =
+    typeof rawStatus === "string"
+      ? rawStatus
+      : ""
+
+  const filter: AnyDoc = {}
+
+  if (status) {
+    const allowedStatuses = ["pending", "approved", "rejected"]
+
+    if (!allowedStatuses.includes(status)) {
+      return fail("Invalid equipment status.")
+    }
+
+    filter.status = status
+  }
+
+  const items = await equipmentCollection()
+    .find(filter)
+    .sort({ createdAt: -1 })
+    .limit(200)
+    .toArray();
+
+  send(res, items)
+}))
+
+app.patch("/api/admin/equipment/:id/status", verifyToken, verifyAdmin, asyncHandler(async (req, res) => {
+
+  const rawId: unknown = req.params.id
+
+  if (typeof rawId !== "string" || !rawId.trim()) {
+    return fail("Invalid equipment ID.", 400, "INVALID_ID")
+  }
+
+  const id = asObjectId(rawId as string, "equipment id")
+
+  const rawBody: unknown = req.body
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    return fail("Invalid equipment status data.")
+  }
+
+  const body = rawBody as Record<string, unknown>
+
+  const rawStatus: unknown = body.status
+
+  const allowedStatuses = ["approved", "rejected", "pending"]
+
+  if (
+    typeof rawStatus !== "string" ||
+    !allowedStatuses.includes(rawStatus)
+  ) {
+    return fail("Invalid equipment status.")
+  }
+
+  const status = rawStatus as EquipmentStatus
+
+  const item = await equipmentCollection().findOne({
+    _id: id,
+  })
+
+  if (!item) {
+    return fail("Equipment not found.", 404)
+  }
+
+  await equipmentCollection().updateOne(
+    { _id: id },
+    {
+      $set: {
+        status,
+        adminNote: cleanText(body.adminNote, 1000),
+        updatedAt: now(),
+      },
+    }
+  )
+
+  await notify(
+    item.ownerId,
+    "equipment_review",
+    `Equipment ${status}`,
+    `${item.name} has been ${status} by an administrator.`
+  )
+
+  send(
+    res,
+    await equipmentCollection().findOne({ _id: id }),
+    `Equipment ${status}.`
+  )
+}))
+
+app.patch("/api/admin/equipment/:id", verifyToken, verifyAdmin, asyncHandler(async (req, res) => {
+
+  const rawId: unknown = req.params.id
+
+  if (typeof rawId !== "string" || !rawId.trim()) {
+    return fail("Invalid equipment ID.", 400, "INVALID_ID")
+  }
+
+  const id = asObjectId(rawId as string, "equipment id")
+
+  const rawBody: unknown = req.body
+
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    return fail("Invalid equipment data.")
+  }
+
+  const body = rawBody as Record<string, unknown>
+
+  const allowedFields = [
+    "name",
+    "description",
+    "category",
+    "location",
+    "rentalPrice",
+    "rentalType",
+    "availableQuantity",
+    "condition",
+    "brand",
+    "model",
+    "image",
+    "gallery",
+    "rentalTerms",
+  ]
+
+  for (const key of Object.keys(body)) {
+    if (!allowedFields.includes(key)) {
+      return fail(`Unsupported equipment field: ${key}`)
+    }
+  }
+
+  const update: AnyDoc = {}
+
+  const isHttpUrl = (value: string): boolean => {
+    try {
+      const parsed = new URL(value);
+      return ["http:", "https:"].includes(parsed.protocol)
+    } catch {
+      return false
+    }
+  }
+
+  if ("name" in body) {
+    const rawName: unknown = body.name
+
+    if (typeof rawName !== "string") {
+      return fail("Equipment name must be a string.")
+    }
+
+    const name = (rawName as string).trim()
+
+    if (name.length < 3 || name.length > 120) {
+      return fail("Equipment name must be between 3 and 120 characters.")
+    }
+
+    update.name = name
+  }
+  
+  if ("description" in body) {
+    const rawDescription: unknown = body.description
+
+    if (typeof rawDescription !== "string") {
+      return fail("Description must be a string.")
+    }
+
+    const description = (rawDescription as string).trim()
+
+    if (description.length < 20 || description.length > 5000) {
+      return fail("Description must be between 20 and 5000 characters.")
+    }
+
+    update.description = description
+  }
+
+  if ("category" in body) {
+    const rawCategory: unknown = body.category
+
+    const categories = [
+      "Construction Equipment",
+      "Photography Equipment",
+      "Vehicles & Transportation",
+      "Agriculture Equipment",
+      "Electronics",
+      "Event Equipment",
+      "Other",
+    ]
+
+    if (
+      typeof rawCategory !== "string" ||
+      !categories.includes(rawCategory)
+    ) {
+      return fail("Invalid equipment category.")
+    }
+
+    update.category = rawCategory;
+  }
+
+  if ("location" in body) {
+    const rawLocation: unknown = body.location
+
+    if (
+      !rawLocation ||
+      typeof rawLocation !== "object" ||
+      Array.isArray(rawLocation)
+    ) {
+      return fail("Invalid equipment location.")
+    }
+
+    const locationInput = rawLocation as Record<string, unknown>
+
+    const rawCity: unknown = locationInput.city
+    const rawAddress: unknown = locationInput.address
+    const rawCountry: unknown = locationInput.country
+
+    if (
+      typeof rawCity !== "string" ||
+      typeof rawAddress !== "string"
+    ) {
+      return fail("Location city and address are required.")
+    }
+
+    const city = (rawCity as string).trim()
+    const address = (rawAddress as string).trim()
+
+    const country =
+      rawCountry === undefined
+        ? "Bangladesh"
+        : typeof rawCountry === "string"
+          ? (rawCountry as string).trim()
+          : ""
+
+    if (city.length < 2 || city.length > 100) {
+      return fail("City must be between 2 and 100 characters.")
+    }
+
+    if (address.length < 3 || address.length > 250) {
+      return fail("Address must be between 3 and 250 characters.")
+    }
+
+    if (country.length < 2 || country.length > 100) {
+      return fail("Country must be between 2 and 100 characters.")
+    }
+
+    const rawLatitude: unknown = locationInput.latitude
+    const rawLongitude: unknown = locationInput.longitude
+
+    if (
+      rawLatitude !== undefined &&
+      (typeof rawLatitude !== "number" || !Number.isFinite(rawLatitude))
+    ) {
+      return fail("Invalid location latitude.")
+    }
+
+    if (
+      rawLongitude !== undefined &&
+      (typeof rawLongitude !== "number" || !Number.isFinite(rawLongitude))
+    ) {
+      return fail("Invalid location longitude.")
+    }
+
+    const locationUpdate: AnyDoc = {
+      city,
+      address,
+      country,
+    }
+
+    if (rawLatitude !== undefined) {
+      locationUpdate.latitude = rawLatitude as number
+    }
+
+    if (rawLongitude !== undefined) {
+      locationUpdate.longitude = rawLongitude as number
+    }
+
+    if (
+      rawLatitude !== undefined &&
+      rawLongitude !== undefined
+    ) {
+      const latitude = rawLatitude as number
+      const longitude = rawLongitude as number
+
+      locationUpdate.geo = {
+        type: "Point",
+        coordinates: [longitude, latitude],
+      }
+    }
+
+    update.location = locationUpdate
+  }
+
+  if ("rentalPrice" in body) {
+    const price: unknown = body.rentalPrice
+
+    if (
+      typeof price !== "number" ||
+      !Number.isFinite(price) ||
+      price <= 0 ||
+      price > 100000000
+    ) {
+      return fail("Invalid rental price.")
+    }
+
+    update.rentalPrice = price
+  }
+
+  if ("rentalType" in body) {
+    const rawType: unknown = body.rentalType
+
+    if (
+      typeof rawType !== "string" ||
+      !["daily", "weekly", "monthly"].includes(rawType)
+    ) {
+      return fail("Invalid rental type.")
+    }
+
+    update.rentalType = rawType
+  }
+
+  if ("availableQuantity" in body) {
+    const quantity: unknown = body.availableQuantity
+
+    if (
+      typeof quantity !== "number" ||
+      !Number.isInteger(quantity) ||
+      quantity < 1 ||
+      quantity > 10000
+    ) {
+      return fail("Invalid available quantity.")
+    }
+
+    update.availableQuantity = quantity
+  }
+
+  if ("condition" in body) {
+    const rawCondition: unknown = body.condition
+
+    if (
+      typeof rawCondition !== "string" ||
+      !["New", "Like New", "Good", "Fair"].includes(rawCondition)
+    ) {
+      return fail("Invalid equipment condition.")
+    }
+
+    update.condition = rawCondition
+  }
+
+  for (const field of ["brand", "model"] as const) {
+    if (field in body) {
+      const rawValue: unknown = body[field]
+
+      if (
+        typeof rawValue !== "string" ||
+        rawValue.length > 100
+      ) {
+        return fail(`${field} must be a string with at most 100 characters.`)
+      }
+
+      update[field] = (rawValue as string).trim()
+    }
+  }
+
+  if ("image" in body) {
+    const rawImage: unknown = body.image
+
+    if (
+      typeof rawImage !== "string" ||
+      (rawImage as string).length > 2000 ||
+      !isHttpUrl(rawImage as string)
+    ) {
+      return fail("Invalid equipment image URL.")
+    }
+
+    update.image = rawImage
+  }
+
+  if ("gallery" in body) {
+    const rawGallery: unknown = body.gallery
+
+    if (
+      !Array.isArray(rawGallery) ||
+      rawGallery.length > 10
+    ) {
+      return fail("Gallery must contain at most 10 image URLs.")
+    }
+
+    const gallery: string[] = []
+
+    for (const value of rawGallery) {
+      if (
+        typeof value !== "string" ||
+        value.length > 2000 ||
+        !isHttpUrl(value as string)
+      ) {
+        return fail("Gallery contains an invalid image URL.")
+      }
+
+      gallery.push(value as string)
+    }
+
+    update.gallery = gallery
+  }
+
+  if ("rentalTerms" in body) {
+    const rawTerms: unknown = body.rentalTerms
+
+    if (
+      typeof rawTerms !== "string" ||
+      rawTerms.length > 4000
+    ) {
+      return fail("Rental terms must be a string with at most 4000 characters.")
+    }
+
+    update.rentalTerms = (rawTerms as string).trim()
+  }
+
+  if (Object.keys(update).length === 0) {
+    return fail("No equipment fields provided.")
+  }
+
+  update.updatedAt = now()
+
+  const result = await equipmentCollection().updateOne(
+    { _id: id },
+    { $set: update }
+  )
+
+  if (!result.matchedCount) {
+    return fail("Equipment not found.", 404)
+  }
+
+  send(
+    res,
+    await equipmentCollection().findOne({ _id: id }),
+    "Equipment updated by admin."
+  )
+}))
+
+app.delete("/api/admin/equipment/:id", verifyToken, verifyAdmin, asyncHandler(async (req, res) => {
+
+  const rawId: unknown = req.params.id
+
+  if (typeof rawId !== "string" || !rawId.trim()) {
+    return fail("Invalid equipment ID.", 400, "INVALID_ID")
+  }
+
+  const id = asObjectId(rawId as string, "equipment id")
+
+  const result = await equipmentCollection().deleteOne({
+    _id: id,
+  });
+
+  if (!result.deletedCount) {
+    return fail("Equipment not found.", 404)
+  }
+
+  await favoritesCollection().deleteMany({
+    equipmentId: id,
+  })
+
+  send(res, null, "Equipment deleted.")
+}))
+
+
 
 app.get("/health", asyncHandler(async (_req, res) => {
   await db.command({ ping: 1 });
