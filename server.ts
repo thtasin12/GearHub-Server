@@ -742,7 +742,9 @@ const env = {
     5,
     Number(process.env.PAYMENT_HOLD_MINUTES ?? 20)
   ),
-};
+  ADMIN_EMAIL: (process.env.ADMIN_EMAIL ?? "").trim().toLowerCase(),
+  ADMIN_BOOTSTRAP_SECRET: process.env.ADMIN_BOOTSTRAP_SECRET ?? "",
+}
 
 if (env.BETTER_AUTH_SECRET.length < 32) {
   throw new Error("BETTER_AUTH_SECRET must be at least 32 characters. Set it in .env.");
@@ -3191,39 +3193,32 @@ app.patch("/api/notifications/read-all", verifyToken, asyncHandler(async (req, r
 }))
 
 
-/* -------------------------- Owner/Admin analytics ----------------------- */
 
-// Owner dashboard analytics
 app.get("/api/owner/analytics", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
-  const user = currentUser(req);
+  const user = currentUser(req)
 
-  // Get owner's equipment IDs
   const ownerEquipment = await equipmentCollection().find(
     { ownerId: user.id },
     { projection: { _id: 1 } }
-  ).toArray();
+  ).toArray()
 
-  const equipmentIds = ownerEquipment.map((item) => item._id);
+  const equipmentIds = ownerEquipment.map((item) => item._id)
 
-  // Fetch owner statistics
   const [
     totalEquipment,
     completedRentals,
     earnings,
     monthly,
   ] = await Promise.all([
-    // Total equipment
     equipmentCollection().countDocuments({
       ownerId: user.id,
     }),
 
-    // Completed rentals
     bookingsCollection().countDocuments({
       ownerId: user.id,
       bookingStatus: "completed",
     }),
 
-    // Total earnings
     paymentsCollection().aggregate([
       {
         $match: {
@@ -3241,7 +3236,6 @@ app.get("/api/owner/analytics", verifyToken, verifyOwner, asyncHandler(async (re
       },
     ]).toArray(),
 
-    // Monthly earnings for the last six calendar months
     paymentsCollection().aggregate([
       {
         $match: {
@@ -3277,7 +3271,7 @@ app.get("/api/owner/analytics", verifyToken, verifyOwner, asyncHandler(async (re
         },
       },
     ]).toArray(),
-  ]);
+  ])
 
   send(res, {
     totalEquipment,
@@ -3409,6 +3403,310 @@ app.get("/api/admin/analytics", verifyToken, verifyAdmin, asyncHandler(async (_r
   })
 }))
 
+
+app.post("/api/admin/bootstrap", asyncHandler(async (req, res) => {
+
+  if (!env.ADMIN_BOOTSTRAP_SECRET || !env.ADMIN_EMAIL) {
+    fail("Admin bootstrap is not configured.", 404)
+  }
+
+  if (req.header("x-bootstrap-secret") !== env.ADMIN_BOOTSTRAP_SECRET) {
+    fail("Invalid bootstrap secret.", 401)
+  }
+
+  const rawBody: unknown = req.body
+
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    fail("Invalid bootstrap data.")
+  }
+
+  const body = rawBody as Record<string, unknown>;
+
+  if (typeof body.email !== "string") {
+    fail("Valid email is required.")
+  }
+
+  const rawEmail: unknown = body.email
+
+  if (typeof rawEmail !== "string") {
+    return fail("Valid email is required.")
+  }
+
+  const email = (rawEmail as string)
+    .trim()
+    .slice(0, 254)
+    .toLowerCase()
+
+  if (email !== env.ADMIN_EMAIL) {
+    fail("Email does not match ADMIN_EMAIL.", 403)
+  }
+
+  const adminCount = await userCollection().countDocuments({
+    role: "admin",
+  });
+
+  if (adminCount > 0) {
+    fail("An administrator already exists. Bootstrap is permanently closed.", 409)
+  }
+
+  const result = await userCollection().updateOne(
+    { email },
+    {
+      $set: {
+        role: "admin",
+        updatedAt: now(),
+      },
+    }
+  )
+
+  if (!result.matchedCount) {
+    fail("Register this email with Better Auth before bootstrapping the admin.", 404)
+  }
+
+  send(
+    res,
+    { email, role: "admin" },
+    "First admin account created."
+  )
+}))
+
+app.get("/api/admin/users", verifyToken, verifyAdmin, asyncHandler(async (req, res) => {
+
+  const page = Math.max(
+    1,
+    Number(req.query.page ?? 1) || 1
+  )
+
+  const limit = Math.min(
+    100,
+    Math.max(1, Number(req.query.limit ?? 20) || 20)
+  )
+
+  const search = cleanText(req.query.search, 100)
+
+  const filter: AnyDoc = {}
+
+  if (search) {
+    const regex = new RegExp(escapeRegex(search), "i");
+
+    filter.$or = [
+      { name: regex },
+      { email: regex },
+    ]
+  }
+
+  const [items, total] = await Promise.all([
+    userCollection()
+      .find(filter, { projection: { password: 0 } })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+
+    userCollection().countDocuments(filter),
+  ])
+
+  send(res, {
+    items,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  })
+}))
+
+app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, asyncHandler(async (req, res) => {
+
+  const actor = currentUser(req);
+
+  const rawBody: unknown = req.body
+
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    fail("Invalid role update data.")
+  }
+
+  const body = rawBody as Record<string, unknown>
+  const rawRole = body.role
+
+  const allowedRoles = ["customer", "owner", "admin"] as const
+
+  if (
+    typeof rawRole !== "string" ||
+    !allowedRoles.includes(rawRole as (typeof allowedRoles)[number])
+  ) {
+    fail("Invalid user role.")
+  }
+
+  const role = rawRole as Role
+
+
+  const id =
+    typeof req.params.id === "string"
+      ? req.params.id.trim().slice(0, 200)
+      : ""
+
+  if (!id) {
+    return fail("Invalid user ID.", 400, "INVALID_ID");
+  }
+
+  const lookupFilter: AnyDoc = {
+    $or: [
+      { id },
+      { email: id.toLowerCase() },
+    ],
+  }
+
+  if (/^[a-f\d]{24}$/i.test(id)) {
+    lookupFilter.$or.push({
+      _id: new ObjectId(id),
+    })
+  }
+
+  const foundTarget = await userCollection().findOne(lookupFilter)
+
+  if (!foundTarget) {
+    return fail("User not found.", 404)
+  }
+
+  const target = foundTarget as AnyDoc
+
+
+  if (!target) {
+    fail("User not found.", 404)
+  }
+
+  if (
+    String(target.email ?? "").toLowerCase() === actor.email &&
+    role !== "admin"
+  ) {
+    fail("You cannot remove your own admin role here.", 409)
+  }
+
+  if (target.role === "admin" && role !== "admin") {
+    const count = await userCollection().countDocuments({
+      role: "admin",
+    });
+
+    if (count <= 1) {
+      fail("The last administrator cannot be demoted.", 409)
+    }
+  }
+
+  const identity: AnyDoc = target.email
+    ? { email: target.email }
+    : { _id: target._id }
+
+  await userCollection().updateOne(
+    identity,
+    {
+      $set: {
+        role,
+        updatedAt: now(),
+      },
+    }
+  )
+
+  send(
+    res,
+    {
+      email: target.email,
+      role,
+    },
+    "User role updated. The new role is enforced on the next API request."
+  )
+}))
+
+app.patch("/api/admin/users/:id/block", verifyToken, verifyAdmin, asyncHandler(async (req, res) => {
+
+  const rawBody: unknown = req.body;
+
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    fail("Invalid user access update.")
+  }
+
+  const body = rawBody as Record<string, unknown>;
+  const rawBlocked = body.isBlocked;
+
+  if (typeof rawBlocked !== "boolean") {
+    fail("isBlocked must be a boolean.")
+  }
+
+  const blocked = rawBlocked as boolean
+
+  const id =
+    typeof req.params.id === "string"
+      ? req.params.id.trim().slice(0, 200)
+      : ""
+  if (!id) {
+    fail("Invalid user ID.", 400, "INVALID_ID")
+  }
+
+  const lookupFilter: AnyDoc = {
+    $or: [
+      { id },
+      { email: id.toLowerCase() },
+    ],
+  }
+
+  if (ObjectId.isValid(id)) {
+    lookupFilter.$or.push({
+      _id: new ObjectId(id),
+    });
+  }
+
+  const foundTarget = await userCollection().findOne(lookupFilter);
+
+  if (!foundTarget) {
+    return fail("User not found.", 404);
+  }
+
+  const target = foundTarget as AnyDoc;
+
+  if (!target) {
+    return fail("User not found.", 404);
+  }
+
+  if (target.role === "admin") {
+    fail("Admin accounts cannot be blocked from this endpoint.", 403);
+  }
+
+  const identity: AnyDoc = target.email
+    ? { email: target.email }
+    : { _id: target._id };
+
+  await userCollection().updateOne(
+    identity,
+    {
+      $set: {
+        isBlocked: blocked,
+        updatedAt: now(),
+      },
+    }
+  )
+
+  send(
+    res,
+    {
+      email: target.email,
+      isBlocked: blocked,
+    },
+    "User access updated."
+  )
+}))
 
 
 app.get("/health", asyncHandler(async (_req, res) => {
