@@ -849,10 +849,9 @@ app.post(
       );
     } catch (error) {
       fail(
-        `Invalid Stripe webhook signature: ${
-          error instanceof Error
-            ? error.message
-            : "verification failed"
+        `Invalid Stripe webhook signature: ${error instanceof Error
+          ? error.message
+          : "verification failed"
         }`,
         400,
         "INVALID_STRIPE_SIGNATURE"
@@ -1090,8 +1089,245 @@ app.post(
   })
 )
 
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true, limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }))
+app.use(express.urlencoded({ extended: true, limit: "1mb" }))
+
+app.get("/api/equipment/featured", asyncHandler(async (req, res) => {
+  const limit = Math.min(
+    12,
+    Math.max(1, Number(req.query.limit ?? 6) || 6)
+  );
+
+  const items = await equipmentCollection()
+    .find({ status: "approved" })
+    .sort({ featured: -1, createdAt: -1 })
+    .limit(limit)
+    .toArray()
+
+  send(res, items)
+}))
+
+app.get("/api/equipment/nearby", asyncHandler(async (req, res) => {
+  const latitude = Number(req.query.lat);
+  const longitude = Number(req.query.lng);
+
+  const maxDistance = Math.min(
+    100000,
+    Math.max(100, Number(req.query.maxDistance ?? 25000))
+  )
+
+  if (
+    !Number.isFinite(latitude) ||
+    !Number.isFinite(longitude) ||
+    Math.abs(latitude) > 90 ||
+    Math.abs(longitude) > 180
+  ) {
+    fail("Valid lat and lng query parameters are required.")
+  }
+
+  const items = await equipmentCollection()
+    .find({
+      status: "approved",
+      "location.geo": {
+        $near: {
+          $geometry: {
+            type: "Point",
+            coordinates: [longitude, latitude],
+          },
+          $maxDistance: maxDistance,
+        },
+      },
+    })
+    .limit(30)
+    .toArray()
+
+  send(res, items)
+}))
+
+app.get("/api/equipment/compare", asyncHandler(async (req, res) => {
+  const ids = String(req.query.ids ?? "")
+    .split(",")
+    .filter(Boolean)
+    .slice(0, 4)
+
+  if (ids.length < 2) {
+    fail("Provide at least 2 equipment ids and no more than 4.")
+  }
+
+  const objectIds = ids.map((id) =>
+    asObjectId(id, "equipment id")
+  )
+
+  const items = await equipmentCollection()
+    .find({
+      _id: { $in: objectIds },
+      status: "approved",
+    })
+    .toArray()
+
+  send(res, items)
+}))
+
+app.get("/api/equipment", asyncHandler(async (req, res) => {
+  const page = Math.max(
+    1,
+    Number(req.query.page ?? 1) || 1
+  )
+
+  const limit = Math.min(
+    48,
+    Math.max(1, Number(req.query.limit ?? 9) || 9)
+  )
+
+  const filter: AnyDoc = { status: "approved" }
+
+  const search = cleanText(
+    req.query.search ?? req.query.q,
+    80
+  )
+
+  if (search) {
+    const regex = new RegExp(escapeRegex(search), "i");
+
+    filter.$or = [
+      { name: regex },
+      { description: regex },
+      { "location.city": regex },
+      { "location.address": regex },
+      { brand: regex },
+      { model: regex },
+    ];
+  }
+
+  if (req.query.category) {
+    filter.category = cleanText(req.query.category, 100)
+  }
+
+  if (req.query.rentalType) {
+    if (
+      !["daily", "weekly", "monthly"].includes(
+        String(req.query.rentalType)
+      )
+    ) {
+      fail("Invalid rentalType filter.")
+    }
+
+    filter.rentalType = String(req.query.rentalType)
+  }
+
+  if (
+    req.query.minPrice !== undefined ||
+    req.query.maxPrice !== undefined
+  ) {
+    const min =
+      req.query.minPrice === undefined
+        ? 0
+        : Number(req.query.minPrice)
+
+    const max =
+      req.query.maxPrice === undefined
+        ? Number.MAX_SAFE_INTEGER
+        : Number(req.query.maxPrice)
+
+    if (
+      !Number.isFinite(min) ||
+      !Number.isFinite(max) ||
+      min < 0 ||
+      max < min
+    ) {
+      fail("Invalid price range.");
+    }
+
+    filter.rentalPrice = {
+      $gte: min,
+      $lte: max,
+    }
+  }
+
+  const sortKey = String(req.query.sort ?? "recent");
+
+  const sortMap = {
+    recent: { createdAt: -1 },
+    price_asc: { rentalPrice: 1 },
+    price_desc: { rentalPrice: -1 },
+    rating: { averageRating: -1, createdAt: -1 },
+    popular: { totalRentals: -1 },
+  } as const
+
+  if (!Object.prototype.hasOwnProperty.call(sortMap, sortKey)) {
+    fail("Invalid sort option.")
+  }
+
+  const sortOption = sortMap[sortKey as keyof typeof sortMap]
+
+  const [items, total] = await Promise.all([
+    equipmentCollection()
+      .find(filter)
+      .sort(sortOption)
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+
+    equipmentCollection().countDocuments(filter),
+  ])
+
+  let enhanced: AnyDoc[] = items
+
+  const from =
+    typeof req.query.from === "string"
+      ? req.query.from
+      : ""
+
+  const to =
+    typeof req.query.to === "string"
+      ? req.query.to
+      : ""
+
+  if (from || to) {
+    if (
+      !from ||
+      !to ||
+      !isValidDate(from) ||
+      !isValidDate(to) ||
+      new Date(to) <= new Date(from)
+    ) {
+      fail(
+        "Provide valid from and to dates for availability filtering."
+      )
+    }
+
+    enhanced = await Promise.all(
+      items.map(async (item) => ({
+        ...item,
+        ...(await getEquipmentAvailability(
+          item,
+          new Date(from),
+          new Date(to)
+        )),
+      }))
+    )
+
+    if (req.query.availableOnly === "true") {
+      enhanced = enhanced.filter(
+        (item) => item.remaining > 0
+      )
+    }
+  } else if (req.query.availableOnly === "true") {
+    enhanced = items.filter(
+      (item) => Number(item.availableQuantity) > 0
+    )
+  }
+
+  send(res, {
+    items: enhanced,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  })
+}))
 
 app.get("/health", asyncHandler(async (_req, res) => {
   await db.command({ ping: 1 });
