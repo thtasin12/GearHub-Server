@@ -2679,6 +2679,78 @@ app.get("/api/payments/session/:sessionId", verifyToken, asyncHandler(async (req
 }))
 
 
+app.get("/api/favorites", verifyToken, verifyRenter, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const favorites = await favoritesCollection()
+    .find({ customerId: user.id })
+    .sort({ createdAt: -1 })
+    .toArray()
+
+  const ids = favorites.map((item) => item.equipmentId)
+
+  const items = ids.length
+    ? await equipmentCollection().find({ _id: { $in: ids } }).toArray()
+    : []
+
+  send(res, items)
+}))
+
+app.post("/api/favorites/:equipmentId", verifyToken, verifyRenter, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const equipmentId =
+    typeof req.params.equipmentId === "string"
+      ? req.params.equipmentId
+      : ""
+
+  if (!equipmentId.trim()) {
+    fail("Invalid equipment ID.", 400, "INVALID_ID")
+  }
+  const item = await equipmentById(equipmentId)
+
+  if (item.status !== "approved") {
+    fail("Equipment is not available.", 404)
+  }
+
+  await favoritesCollection().updateOne(
+    {
+      customerId: user.id,
+      equipmentId: item._id,
+    },
+    {
+      $setOnInsert: {
+        customerId: user.id,
+        equipmentId: item._id,
+        createdAt: now(),
+      },
+    },
+    { upsert: true }
+  )
+
+  send(res, null, "Added to favorites.", 201)
+}));
+
+app.delete("/api/favorites/:equipmentId", verifyToken, verifyRenter, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const equipmentId =
+    typeof req.params.equipmentId === "string"
+      ? req.params.equipmentId
+      : ""
+
+  if (!equipmentId.trim()) {
+    fail("Invalid equipment ID.", 400, "INVALID_ID")
+  }
+
+  await favoritesCollection().deleteOne({
+    customerId: user.id,
+    equipmentId: asObjectId(equipmentId, "equipment id"),
+  })
+
+  send(res, null, "Removed from favorites.")
+}))
+
 
 
 app.get("/health", asyncHandler(async (_req, res) => {
