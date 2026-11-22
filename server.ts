@@ -28,6 +28,8 @@ import {
   type JWTPayload,
 } from "jose"
 import Stripe from "stripe";
+import cron from "node-cron"
+
 dotenv.config();
 
 let db!: Db;
@@ -5023,6 +5025,171 @@ app.get("/api/bookings/:id/tracking", verifyToken, asyncHandler(async (req, res)
 }))
 
 
+app.use((_req, _res, next) => {
+  next(new AppError("API endpoint not found.", 404, "NOT_FOUND"))
+})
+
+app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  if (res.headersSent) return
+
+  const err = (
+    typeof error === "object" && error !== null
+      ? error
+      : {}
+  ) as AnyDoc
+
+  const rawStatus = Number(err.statusCode ?? err.status ?? 500)
+
+  const status =
+    Number.isInteger(rawStatus) && rawStatus >= 400 && rawStatus <= 599
+      ? rawStatus
+      : 500
+
+  const message =
+    status >= 500
+      ? "Internal server error."
+      : String(err.message ?? "Request failed.")
+
+  if (status >= 500) {
+    console.error("GearHub API error:", error)
+  }
+
+  res.status(status).json({
+    success: false,
+    message,
+    ...(env.NODE_ENV !== "production" && err.code
+      ? { code: err.code }
+      : {}),
+  })
+})
+
+async function createIndexes() {
+  await Promise.all([
+    equipmentCollection().createIndex({ status: 1, createdAt: -1 }),
+    equipmentCollection().createIndex({ ownerId: 1, createdAt: -1 }),
+    equipmentCollection().createIndex({ category: 1, rentalType: 1, rentalPrice: 1 }),
+    equipmentCollection().createIndex({ "location.geo": "2dsphere" }),
+
+    bookingsCollection().createIndex({ equipmentId: 1, startAt: 1, endAt: 1, bookingStatus: 1 }),
+    bookingsCollection().createIndex({ customerId: 1, createdAt: -1 }),
+    bookingsCollection().createIndex({ ownerId: 1, createdAt: -1 }),
+    bookingsCollection().createIndex({ bookingStatus: 1, holdExpiresAt: 1 }),
+
+    paymentsCollection().createIndex(
+      { stripeSessionId: 1 },
+      { unique: true, sparse: true }
+    ),
+    paymentsCollection().createIndex({ customerId: 1, createdAt: -1 }),
+    paymentsCollection().createIndex({ ownerId: 1, status: 1 }),
+
+    favoritesCollection().createIndex(
+      { customerId: 1, equipmentId: 1 },
+      { unique: true }
+    ),
+
+    reviewsCollection().createIndex(
+      { equipmentId: 1, customerId: 1 },
+      { unique: true }
+    ),
+
+    notificationsCollection().createIndex({ userId: 1, createdAt: -1 }),
+    conversationsCollection().createIndex({ participants: 1, updatedAt: -1 }),
+    messagesCollection().createIndex({ conversationId: 1, createdAt: 1 }),
+    handoversCollection().createIndex({ bookingId: 1, createdAt: 1 }),
+    extensionsCollection().createIndex({ bookingId: 1, createdAt: -1 }),
+
+    getCollection("processedStripeEvents").createIndex(
+      { processedAt: 1 },
+      { expireAfterSeconds: 60 * 60 * 24 * 90 }
+    ),
+  ])
+}
+
+function startCronJobs() {
+  cron.schedule("*/5 * * * *", async () => {
+    try {
+      const timestamp = now()
+
+      const expired = await bookingsCollection()
+        .find({
+          bookingStatus: "pending_payment",
+          holdExpiresAt: { $lte: timestamp },
+        })
+        .toArray()
+
+      for (const booking of expired) {
+        const result = await bookingsCollection().updateOne(
+          {
+            _id: booking._id,
+            bookingStatus: "pending_payment",
+          },
+          {
+            $set: {
+              bookingStatus: "expired",
+              updatedAt: timestamp,
+            },
+          }
+        )
+
+        if (result.modifiedCount) {
+          await notify(
+            booking.customerId,
+            "payment_hold_expired",
+            "Booking hold expired",
+            `Your payment hold for ${booking.equipmentName} expired. Please book again.`
+          )
+        }
+      }
+
+      const completed = await bookingsCollection()
+        .find({
+          bookingStatus: {
+            $in: ["confirmed", "in_progress"],
+          },
+          paymentStatus: "paid",
+          endAt: { $lte: timestamp },
+        })
+        .toArray()
+
+      for (const booking of completed) {
+        const result = await bookingsCollection().updateOne(
+          {
+            _id: booking._id,
+            bookingStatus: {
+              $in: ["confirmed", "in_progress"],
+            },
+          },
+          {
+            $set: {
+              bookingStatus: "completed",
+              completedAt: timestamp,
+              updatedAt: timestamp,
+            },
+          }
+        )
+
+        if (result.modifiedCount) {
+          await notify(
+            booking.customerId,
+            "rental_completed",
+            "Rental completed",
+            `${booking.equipmentName} rental has been marked completed.`
+          )
+
+          await notify(
+            booking.ownerId,
+            "rental_completed",
+            "Rental completed",
+            `${booking.equipmentName} rental has ended.`
+          )
+        }
+      }
+    } catch (error) {
+      console.error("GearHub cron job failed:", error)
+    }
+  })
+}
+
 
 app.get("/health", asyncHandler(async (_req, res) => {
   await db.command({ ping: 1 });
@@ -5067,6 +5234,34 @@ app.get("/", (req, res) => {
 
 
 
-app.listen(env.PORT, () => {
-  console.log(`Server: http://localhost:${env.PORT}`);
-});
+async function startServer() {
+  try {
+    await mongoClient.connect()
+
+    db = mongoClient.db(env.MONGODB_DB_NAME)
+
+    await db.command({ ping: 1 })
+
+    await initializeAuth()
+
+    await createIndexes()
+
+    startCronJobs()
+
+    app.listen(env.PORT, () => {
+      console.log(`\nGearHub API running on http://localhost:${env.PORT}`)
+      console.log(`Health: ${env.BETTER_AUTH_URL}/health`)
+      console.log(`Better Auth: ${env.BETTER_AUTH_URL}/api/auth`)
+      console.log(`Google OAuth: ${env.GOOGLE_CLIENT_ID ? "configured" : "not configured"}`)
+      console.log(`Stripe: ${stripe ? "configured" : "not configured (test routes unavailable)"}\n`)
+    })
+  } catch (error) {
+    console.error("Failed to start GearHub API:", error)
+
+    await mongoClient.close().catch(() => undefined)
+
+    process.exit(1)
+  }
+}
+
+void startServer()
