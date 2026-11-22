@@ -739,9 +739,9 @@ const env = {
     process.env.STRIPE_CANCEL_URL ??
     "http://localhost:3000/payment/cancel",
   PAYMENT_HOLD_MINUTES: Math.max(
-  5,
-  Number(process.env.PAYMENT_HOLD_MINUTES ?? 20)
-),
+    5,
+    Number(process.env.PAYMENT_HOLD_MINUTES ?? 20)
+  ),
 };
 
 if (env.BETTER_AUTH_SECRET.length < 32) {
@@ -1707,7 +1707,7 @@ app.get("/api/owner/equipment", verifyToken, verifyOwner, asyncHandler(async (re
 app.get("/api/owner/equipment/:id", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
   const user = currentUser(req);
   const equipmentId =
-  typeof req.params.id === "string" ? req.params.id : "";
+    typeof req.params.id === "string" ? req.params.id : "";
 
   const item = await equipmentCollection().findOne({
     _id: asObjectId(equipmentId, "equipment id"),
@@ -2499,6 +2499,185 @@ app.patch("/api/owner/bookings/:id/status", verifyToken, verifyOwner, asyncHandl
     "Booking status updated."
   )
 }))
+
+
+app.post("/api/payments/checkout/:bookingId", verifyToken, verifyRenter, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const bookingId =
+    typeof req.params.bookingId === "string"
+      ? req.params.bookingId
+      : ""
+
+  if (!bookingId.trim()) {
+    fail("Invalid booking ID.", 400, "INVALID_ID")
+  }
+
+  const booking = await bookingById(bookingId)
+
+  if (booking.customerId !== user.id) {
+    fail("You cannot pay for this booking.", 403);
+  }
+
+  if (
+    booking.bookingStatus !== "pending_payment" ||
+    booking.paymentStatus === "paid"
+  ) {
+    fail("This booking is not awaiting payment.", 409);
+  }
+
+  if (booking.holdExpiresAt && new Date(booking.holdExpiresAt) < now()) {
+    fail(
+      "The booking payment hold has expired. Please create a new booking.",
+      409
+    )
+  }
+
+  const existing = await paymentsCollection().findOne({
+    bookingId: booking._id,
+    status: "pending",
+    checkoutUrl: { $exists: true },
+  })
+
+  if (
+    existing?.checkoutUrl &&
+    existing.expiresAt &&
+    new Date(existing.expiresAt) > now()
+  ) {
+    return send(
+      res,
+      {
+        checkoutUrl: existing.checkoutUrl,
+        sessionId: existing.stripeSessionId,
+        paymentId: existing._id,
+      },
+      "Existing checkout session returned."
+    )
+  }
+
+  const paymentId = new ObjectId()
+
+  const session = await createStripeCheckout({
+    amount: Number(booking.totalAmount),
+    currency: env.STRIPE_CURRENCY,
+
+    productName: `GearHub rental: ${booking.equipmentName}`,
+    description: `${booking.durationDays} day(s), quantity ${booking.requiredQuantity}`,
+
+    customerEmail: user.email,
+
+    metadata: {
+      kind: "booking",
+      bookingId: String(booking._id),
+      paymentId: String(paymentId),
+      customerId: user.id,
+      ownerId: booking.ownerId,
+    },
+
+    idempotencyKey: `gearhub-booking-${booking._id}-${paymentId}`,
+  })
+
+  if (!session.url) {
+    fail("Stripe did not return a checkout URL.", 502)
+  }
+
+  const payment = {
+    _id: paymentId,
+    bookingId: booking._id,
+    customerId: user.id,
+    ownerId: booking.ownerId,
+
+    stripeSessionId: session.id,
+
+    stripePaymentIntentId:
+      typeof session.payment_intent === "string"
+        ? session.payment_intent
+        : null,
+
+    checkoutUrl: session.url,
+
+    amount: Number(booking.totalAmount),
+
+    amountMinor: toStripeMinorUnits(
+      Number(booking.totalAmount),
+      env.STRIPE_CURRENCY
+    ),
+
+    currency: env.STRIPE_CURRENCY,
+    status: "pending",
+    purpose: "booking",
+
+    createdAt: now(),
+
+    expiresAt: session.expires_at
+      ? new Date(session.expires_at * 1000)
+      : addMinutes(now(), 30),
+  }
+
+  await paymentsCollection().insertOne(payment)
+
+  await bookingsCollection().updateOne(
+    { _id: booking._id },
+    {
+      $set: {
+        stripeSessionId: session.id,
+        updatedAt: now(),
+      },
+    }
+  )
+
+  send(
+    res,
+    {
+      checkoutUrl: session.url,
+      sessionId: session.id,
+      paymentId,
+    },
+    "Stripe Checkout session created.",
+    201
+  )
+}))
+
+
+app.get("/api/payments/my", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+  const items = await paymentsCollection()
+    .find({ customerId: user.id })
+    .sort({ createdAt: -1 })
+    .limit(100)
+    .toArray()
+
+  send(res, items)
+}));
+
+
+app.get("/api/payments/session/:sessionId", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const sessionId = req.params.sessionId
+
+  if (typeof sessionId !== "string" || !sessionId.trim()) {
+    fail("Invalid payment session ID.", 400)
+  }
+
+  const payment = await paymentsCollection().findOne({
+    stripeSessionId: sessionId,
+    customerId: user.id,
+  })
+
+  if (!payment) {
+    return fail("Payment session not found.", 404)
+  }
+
+  send(res, {
+    status: payment.status,
+    amount: payment.amount,
+    currency: payment.currency,
+    bookingId: payment.bookingId,
+  })
+}))
+
 
 
 
