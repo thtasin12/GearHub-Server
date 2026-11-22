@@ -74,6 +74,16 @@ class AppError extends Error {
   }
 }
 
+const asyncHandler = (
+  fn: (
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ) => Promise<unknown> | unknown
+): RequestHandler =>
+  (req, res, next) =>
+    Promise.resolve(fn(req, res, next)).catch(next)
+
 
 async function initializeAuth() {
   const googleConfigured = Boolean(
@@ -226,6 +236,122 @@ async function initializeAuth() {
   ) => void
 }
 
+const verifyToken: RequestHandler = asyncHandler(async (req, _res, next) => {
+  const header = req.headers.authorization;
+
+  if (
+    typeof header !== "string" ||
+    !header.startsWith("Bearer ")
+  ) {
+    fail("Authentication token is required.", 401, "UNAUTHORIZED");
+  }
+
+  const token = (header as string).slice(7).trim();
+
+  if (!token) {
+    fail("Authentication token is required.", 401, "UNAUTHORIZED");
+  }
+
+  let payload: JWTPayload | undefined;
+
+  try {
+    ({ payload } = await jwtVerify(token, JWKS, {
+      issuer: env.BETTER_AUTH_URL,
+      audience: env.BETTER_AUTH_URL,
+    }));
+  } catch {
+    fail(
+      "Invalid or expired access token. Please sign in again.",
+      401,
+      "INVALID_TOKEN"
+    );
+  }
+
+  const resolvedPayload = payload!;
+
+  const email =
+    typeof resolvedPayload.email === "string"
+      ? resolvedPayload.email.toLowerCase()
+      : "";
+
+  const subject =
+    typeof resolvedPayload.sub === "string"
+      ? resolvedPayload.sub
+      : "";
+
+  if (!email || !subject) {
+    fail("Invalid access token payload.", 401, "INVALID_TOKEN");
+  }
+
+  // Read the current role and blocked state from MongoDB.
+  const dbUser = await userCollection().findOne({ email });
+
+  if (!dbUser || dbUser.isBlocked === true) {
+    fail("Account is unavailable.", 401, "ACCOUNT_UNAVAILABLE");
+  }
+
+  const resolvedUser = dbUser!;
+
+  const role: Role = isRole(resolvedUser.role)
+    ? resolvedUser.role
+    : "customer";
+
+  (req as AuthRequest).authUser = {
+    id: subject,
+    email,
+    name: String(
+      resolvedUser.name ??
+      resolvedPayload.name ??
+      "GearHub User"
+    ),
+    role,
+    ...(typeof resolvedUser.image === "string"
+      ? { image: resolvedUser.image }
+      : {}),
+  };
+
+  next();
+});
+
+const requireRole = (...roles: Role[]): RequestHandler =>
+  (req, _res, next) => {
+    const user = (req as AuthRequest).authUser;
+
+    if (!user) {
+      return next(
+        new AppError("Authentication required.", 401)
+      );
+    }
+
+    if (!roles.includes(user.role)) {
+      return next(
+        new AppError(
+          "You do not have permission to perform this action.",
+          403,
+          "FORBIDDEN"
+        )
+      );
+    }
+
+    next();
+  };
+
+const verifyRenter = requireRole("customer");
+const verifyOwner = requireRole("owner");
+const verifyAdmin = requireRole("admin");
+
+const currentUser = (req: Request): AuthUser => {
+  const user = (req as AuthRequest).authUser;
+
+  if (!user) {
+    fail("Authentication required.", 401);
+  }
+
+  return user!;
+};
+
+
+
 
 const asObjectId = (value: string, label = "id"): ObjectId => {
   if (!ObjectId.isValid(value)) {
@@ -275,16 +401,6 @@ const conversationsCollection = () => getCollection("conversations")
 const messagesCollection = () => getCollection("messages")
 const handoversCollection = () => getCollection("handovers")
 const extensionsCollection = () => getCollection("extensions")
-
-const asyncHandler = (
-  fn: (
-    req: Request,
-    res: Response,
-    next: NextFunction
-  ) => Promise<unknown> | unknown
-): RequestHandler =>
-  (req, res, next) =>
-    Promise.resolve(fn(req, res, next)).catch(next);
 
 const send = (
   res: Response,
