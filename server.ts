@@ -738,6 +738,10 @@ const env = {
   STRIPE_CANCEL_URL:
     process.env.STRIPE_CANCEL_URL ??
     "http://localhost:3000/payment/cancel",
+  PAYMENT_HOLD_MINUTES: Math.max(
+  5,
+  Number(process.env.PAYMENT_HOLD_MINUTES ?? 20)
+),
 };
 
 if (env.BETTER_AUTH_SECRET.length < 32) {
@@ -2037,6 +2041,232 @@ app.delete("/api/equipment/:id", verifyToken, verifyOwner, asyncHandler(async (r
   send(res, null, "Equipment deleted.");
 }))
 
+
+app.post("/api/bookings", verifyToken, verifyRenter, asyncHandler(async (req, res) => {
+  const rawBody: unknown = req.body
+
+  if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+    fail("Invalid booking information.")
+  }
+
+  const body = rawBody as AnyDoc
+
+  const equipmentId = body.equipmentId
+
+  if (typeof equipmentId !== "string" || equipmentId.length < 1) {
+    fail("Equipment ID is required.")
+  }
+
+  const startAtValue = body.startAt
+
+  const dateTimeWithOffset =
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
+
+  if (
+    typeof startAtValue !== "string" ||
+    !dateTimeWithOffset.test(startAtValue) ||
+    !isValidDate(startAtValue)
+  ) {
+    fail("Start date must be a valid ISO date with timezone.")
+  }
+
+  const endAtValue = body.endAt
+
+  if (
+    typeof endAtValue !== "string" ||
+    !dateTimeWithOffset.test(endAtValue) ||
+    !isValidDate(endAtValue)
+  ) {
+    fail("End date must be a valid ISO date with timezone.")
+  }
+
+  const requiredQuantity = body.requiredQuantity
+
+  if (
+    typeof requiredQuantity !== "number" ||
+    !Number.isInteger(requiredQuantity) ||
+    requiredQuantity < 1 ||
+    requiredQuantity > 1000
+  ) {
+    fail("Required quantity must be between 1 and 1000.")
+  }
+
+  const contactInput = body.contactNumber
+
+  if (typeof contactInput !== "string") {
+    fail("Contact number is required.")
+  }
+
+  const contactNumber = contactInput.trim()
+
+  if (contactNumber.length < 6 || contactNumber.length > 30) {
+    fail("Contact number must be between 6 and 30 characters.")
+  }
+
+  const addressInput = body.deliveryAddress
+
+  if (typeof addressInput !== "string") {
+    fail("Delivery address is required.")
+  }
+
+  const deliveryAddress = addressInput.trim()
+
+  if (deliveryAddress.length < 5 || deliveryAddress.length > 500) {
+    fail("Delivery address must be between 5 and 500 characters.")
+  }
+
+  const notesInput = body.additionalNotes
+
+  if (notesInput !== undefined && typeof notesInput !== "string") {
+    fail("Additional notes must be text.")
+  }
+
+  const additionalNotes =
+    typeof notesInput === "string" ? notesInput.trim() : ""
+
+  if (additionalNotes.length > 2000) {
+    fail("Additional notes must not exceed 2000 characters.")
+  }
+
+  const user = currentUser(req)
+
+  const startAt = new Date(startAtValue)
+  const endAt = new Date(endAtValue)
+
+  const item = await equipmentById(equipmentId)
+
+  if (item.status !== "approved") {
+    fail("This equipment is not approved for rental.", 409)
+  }
+
+  if (item.ownerId === user.id) {
+    fail("You cannot rent your own equipment.", 403)
+  }
+
+  if (startAt < new Date(Date.now() - 5 * 60_000)) {
+    fail("Rental start date cannot be in the past.")
+  }
+
+  const amount = calculateRental(
+    item.rentalPrice,
+    item.rentalType as RentalType,
+    startAt,
+    endAt,
+    requiredQuantity
+  )
+
+  const lockToken = new ObjectId().toHexString()
+
+  const lock = await equipmentCollection().updateOne(
+    {
+      _id: item._id,
+      $or: [
+        { bookingLockUntil: { $lt: now() } },
+        { bookingLockUntil: { $exists: false } },
+      ],
+    },
+    {
+      $set: {
+        bookingLockToken: lockToken,
+        bookingLockUntil: addMinutes(now(), 1),
+      },
+    }
+  )
+
+  if (!lock.matchedCount) {
+    fail(
+      "This equipment is receiving another booking. Please retry in a moment.",
+      409,
+      "BOOKING_LOCKED"
+    )
+  }
+
+  try {
+    await checkAvailability(
+      item._id,
+      startAt,
+      endAt,
+      requiredQuantity,
+      Number(item.availableQuantity)
+    )
+
+    const booking = {
+      equipmentId: item._id,
+      equipmentName: item.name,
+      equipmentImage: item.image,
+      category: item.category,
+
+      ownerId: item.ownerId,
+      ownerEmail: item.ownerEmail,
+      ownerName: item.ownerName,
+
+      customerId: user.id,
+      customerEmail: user.email,
+      customerName: user.name,
+
+      rentalType: item.rentalType,
+      unitPrice: amount.unitPrice,
+      rentalPeriods: amount.periods,
+      durationDays: amount.days,
+
+      startAt,
+      endAt,
+      requiredQuantity,
+
+      contactNumber,
+      deliveryAddress,
+      additionalNotes,
+
+      totalAmount: amount.total,
+      currency: env.STRIPE_CURRENCY,
+
+      paymentStatus: "unpaid",
+      bookingStatus: "pending_payment",
+
+      holdExpiresAt: addMinutes(
+        now(),
+        env.PAYMENT_HOLD_MINUTES
+      ),
+
+      createdAt: now(),
+      updatedAt: now(),
+    }
+
+    const result = await bookingsCollection().insertOne(booking)
+
+    await notify(
+      item.ownerId,
+      "booking_request",
+      "New rental request",
+      `${user.name} requested ${item.name}.`,
+      "/dashboard/owner/rentals"
+    )
+
+    send(
+      res,
+      {
+        ...booking,
+        _id: result.insertedId,
+        amountBreakdown: amount,
+      },
+      "Booking created. Continue to secure payment.",
+      201
+    )
+  } finally {
+    await equipmentCollection().updateOne(
+      {
+        _id: item._id,
+        bookingLockToken: lockToken,
+      },
+      {
+        $unset: {
+          bookingLockToken: "",
+          bookingLockUntil: "",
+        },
+      }
+    )
+  }
+}))
 
 
 
