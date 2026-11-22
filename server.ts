@@ -287,7 +287,7 @@ const verifyToken: RequestHandler = asyncHandler(async (req, _res, next) => {
     fail("Invalid access token payload.", 401, "INVALID_TOKEN");
   }
 
-  // Read the current role and blocked state from MongoDB.
+
   const dbUser = await userCollection().findOne({ email });
 
   if (!dbUser || dbUser.isBlocked === true) {
@@ -781,6 +781,7 @@ const corsOptions: CorsOptions = {
 
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
+app.use(express.json())
 
 app.use(
   helmet({
@@ -821,6 +822,276 @@ let JWKS: ReturnType<typeof createRemoteJWKSet> = undefined as any
 const mongoClient = new MongoClient(env.MONGODB_URI, {
   serverSelectionTimeoutMS: 15000
 })
+
+app.post(
+  "/api/payments/webhook",
+  express.raw({ type: "application/json" }),
+  asyncHandler(async (req, res) => {
+    const stripeClient = requireStripe()
+
+    if (!env.STRIPE_WEBHOOK_SECRET) {
+      fail("STRIPE_WEBHOOK_SECRET is not configured.", 503);
+    }
+
+    const signature = req.headers["stripe-signature"];
+
+    if (typeof signature !== "string") {
+      fail("Missing Stripe signature.", 400)
+    }
+
+    let event: Stripe.Event | undefined
+
+    try {
+      event = stripeClient.webhooks.constructEvent(
+        req.body as Buffer,
+        signature as string,
+        env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (error) {
+      fail(
+        `Invalid Stripe webhook signature: ${
+          error instanceof Error
+            ? error.message
+            : "verification failed"
+        }`,
+        400,
+        "INVALID_STRIPE_SIGNATURE"
+      )
+    }
+
+    const resolvedEvent = event!
+
+    const alreadyProcessed =
+      await getCollection("processedStripeEvents").findOne({
+        stripeEventId: resolvedEvent.id,
+      })
+
+    if (alreadyProcessed) {
+      return send(res, { received: true, duplicate: true })
+    }
+
+    if (
+      [
+        "checkout.session.completed",
+        "checkout.session.async_payment_succeeded",
+      ].includes(resolvedEvent.type)
+    ) {
+      const session =
+        resolvedEvent.data.object as Stripe.Checkout.Session;
+
+      const payment = await paymentsCollection().findOne({
+        stripeSessionId: session.id,
+      })
+
+      if (payment) {
+        const amountMatches =
+          Number(session.amount_total) === Number(payment.amountMinor)
+
+        const currencyMatches =
+          String(session.currency).toLowerCase() ===
+          String(payment.currency).toLowerCase()
+
+        const metadataMatches =
+          session.metadata?.paymentId === String(payment._id)
+
+        if (!amountMatches || !currencyMatches || !metadataMatches) {
+          await paymentsCollection().updateOne(
+            { _id: payment._id },
+            {
+              $set: {
+                status: "review_required",
+                webhookWarning:
+                  "Stripe amount/currency/metadata mismatch",
+                updatedAt: now(),
+              },
+            }
+          )
+        } else if (session.payment_status === "paid") {
+          if (payment.purpose === "booking") {
+            const booking = await bookingsCollection().findOne({
+              _id: payment.bookingId,
+            })
+
+            if (
+              booking &&
+              !["cancelled", "expired"].includes(booking.bookingStatus)
+            ) {
+              await paymentsCollection().updateOne(
+                {
+                  _id: payment._id,
+                  status: { $ne: "paid" },
+                },
+                {
+                  $set: {
+                    status: "paid",
+                    stripePaymentIntentId:
+                      typeof session.payment_intent === "string"
+                        ? session.payment_intent
+                        : null,
+                    paidAt: now(),
+                    updatedAt: now(),
+                  },
+                }
+              )
+
+              await bookingsCollection().updateOne(
+                {
+                  _id: booking._id,
+                  paymentStatus: { $ne: "paid" },
+                },
+                {
+                  $set: {
+                    paymentStatus: "paid",
+                    bookingStatus: "confirmed",
+                    paidAt: now(),
+                    updatedAt: now(),
+                  },
+                }
+              )
+
+              await equipmentCollection().updateOne(
+                { _id: booking.equipmentId },
+                { $inc: { totalRentals: 1 } }
+              )
+
+              await notify(
+                booking.customerId,
+                "payment_success",
+                "Payment successful",
+                `Your ${booking.equipmentName} rental is confirmed.`,
+                "/dashboard/customer/rentals"
+              )
+
+              await notify(
+                booking.ownerId,
+                "payment_success",
+                "New paid booking",
+                `${booking.equipmentName} has a confirmed rental.`,
+                "/dashboard/owner/rentals"
+              );
+            } else {
+              const intent =
+                typeof session.payment_intent === "string"
+                  ? session.payment_intent
+                  : null;
+
+              if (intent) {
+                await stripeClient.refunds.create({
+                  payment_intent: intent,
+                  reason: "requested_by_customer",
+                })
+              }
+
+              await paymentsCollection().updateOne(
+                { _id: payment._id },
+                {
+                  $set: {
+                    status: "refunded",
+                    refundedAt: now(),
+                    updatedAt: now(),
+                  },
+                }
+              )
+            }
+          } else if (payment.purpose === "extension") {
+            const extension = await extensionsCollection().findOne({
+              _id: payment.extensionId,
+              status: "approved",
+            })
+
+            if (extension) {
+              await extensionsCollection().updateOne(
+                { _id: extension._id },
+                {
+                  $set: {
+                    status: "paid",
+                    paidAt: now(),
+                  },
+                }
+              );
+
+              await bookingsCollection().updateOne(
+                { _id: extension.bookingId },
+                {
+                  $set: {
+                    endAt: extension.newEndAt,
+                    updatedAt: now(),
+                  },
+                  $inc: {
+                    totalAmount: Number(extension.amount),
+                  },
+                }
+              );
+
+              await paymentsCollection().updateOne(
+                { _id: payment._id },
+                {
+                  $set: {
+                    status: "paid",
+                    stripePaymentIntentId:
+                      typeof session.payment_intent === "string"
+                        ? session.payment_intent
+                        : null,
+                    paidAt: now(),
+                  },
+                }
+              );
+            }
+          }
+        }
+      }
+    } else if (
+      resolvedEvent.type === "checkout.session.expired" ||
+      resolvedEvent.type === "checkout.session.async_payment_failed"
+    ) {
+      const session =
+        resolvedEvent.data.object as Stripe.Checkout.Session;
+
+      const payment = await paymentsCollection().findOne({
+        stripeSessionId: session.id,
+      })
+
+      if (payment && payment.status !== "paid") {
+        await paymentsCollection().updateOne(
+          { _id: payment._id },
+          {
+            $set: {
+              status: "failed",
+              updatedAt: now(),
+            },
+          }
+        )
+
+        if (payment.purpose === "booking") {
+          await bookingsCollection().updateOne(
+            {
+              _id: payment.bookingId,
+              paymentStatus: { $ne: "paid" },
+            },
+            {
+              $set: {
+                paymentStatus: "failed",
+                bookingStatus: "payment_failed",
+                updatedAt: now(),
+              },
+            }
+          );
+        }
+      }
+    }
+
+    await getCollection("processedStripeEvents").insertOne({
+      stripeEventId: resolvedEvent.id,
+      type: resolvedEvent.type,
+      processedAt: now(),
+    })
+
+    send(res, { received: true })
+  })
+)
+
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 
 app.get("/health", asyncHandler(async (_req, res) => {
   await db.command({ ping: 1 });
