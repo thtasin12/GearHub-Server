@@ -3077,6 +3077,119 @@ app.get("/api/equipment/:id/reviews", asyncHandler(async (req, res) => {
   })
 }))
 
+app.get("/api/notifications", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const page = Math.max(
+    1,
+    Number(req.query.page ?? 1) || 1
+  )
+
+  const limit = Math.min(
+    100,
+    Math.max(1, Number(req.query.limit ?? 20) || 20)
+  )
+
+  const [items, total, unread] = await Promise.all([
+    notificationsCollection()
+      .find({ userId: user.id })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+
+    notificationsCollection().countDocuments({
+      userId: user.id,
+    }),
+
+    notificationsCollection().countDocuments({
+      userId: user.id,
+      read: false,
+    }),
+  ])
+
+  send(res, {
+    items,
+    unread,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  })
+}))
+
+app.patch("/api/notifications/:id/read", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const notificationId =
+    typeof req.params.id === "string"
+      ? (req.params.id as string)
+      : ""
+
+  if (!notificationId.trim()) {
+    fail("Invalid notification ID.", 400, "INVALID_ID")
+  }
+
+  const rawBody: unknown = req.body
+
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    fail("Invalid notification update.")
+  }
+
+  const body = rawBody as Record<string, unknown>
+
+  const rawRead = body.read
+  const read = rawRead === undefined ? true : rawRead
+
+  if (typeof read !== "boolean") {
+    fail("Notification read status must be a boolean.")
+  }
+
+  const result = await notificationsCollection().updateOne(
+    {
+      _id: asObjectId(notificationId, "notification id"),
+      userId: user.id,
+    },
+    {
+      $set: {
+        read: read as boolean,
+        readAt: read ? now() : null,
+      },
+    }
+  )
+
+  if (!result.matchedCount) {
+    fail("Notification not found.", 404);
+  }
+
+  send(res, null, "Notification updated.");
+}))
+
+app.patch("/api/notifications/read-all", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+  await notificationsCollection().updateMany(
+    {
+      userId: user.id,
+      read: false,
+    },
+    {
+      $set: {
+        read: true,
+        readAt: now(),
+      },
+    }
+  )
+
+  send(res, null, "All notifications marked as read.")
+}))
+
 
 app.get("/health", asyncHandler(async (_req, res) => {
   await db.command({ ping: 1 });
