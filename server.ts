@@ -2802,7 +2802,6 @@ app.patch("/api/profile", verifyToken, asyncHandler(async (req, res) => {
 
   const updates: AnyDoc = {}
 
-  // Validate name
   if ("name" in body) {
     const rawName: unknown = body.name
 
@@ -2819,7 +2818,6 @@ app.patch("/api/profile", verifyToken, asyncHandler(async (req, res) => {
     updates.name = name
   }
 
-  // Validate image URL
   if ("image" in body) {
     const rawImage: unknown = body.image;
 
@@ -2913,6 +2911,170 @@ app.patch("/api/profile", verifyToken, asyncHandler(async (req, res) => {
   )
 
   send(res, updatedProfile, "Profile updated.")
+}))
+
+app.post("/api/equipment/:id/reviews", verifyToken, verifyRenter, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+  const equipmentId =
+    typeof req.params.id === "string"
+      ? req.params.id
+      : ""
+
+  if (!equipmentId.trim()) {
+    fail("Invalid equipment ID.", 400, "INVALID_ID")
+  }
+
+  const item = await equipmentById(equipmentId)
+
+  const rawBody: unknown = req.body
+
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    fail("Invalid review data.")
+  }
+
+  const body = rawBody as Record<string, unknown>
+
+  const rawRating: unknown = body.rating
+
+  if (
+    typeof rawRating !== "number" ||
+    !Number.isInteger(rawRating) ||
+    rawRating < 1 ||
+    rawRating > 5
+  ) {
+    fail("Rating must be an integer between 1 and 5.")
+  }
+
+  const rating = rawRating as number
+
+  const rawComment: unknown = body.comment
+
+  if (typeof rawComment !== "string") {
+    fail("Review comment must be a string.")
+  }
+
+  const comment = (rawComment as string).trim()
+
+  if (comment.length < 5 || comment.length > 1200) {
+    fail("Review comment must be between 5 and 1200 characters.");
+  }
+
+  const completedBooking = await bookingsCollection().findOne({
+    equipmentId: item._id,
+    customerId: user.id,
+    bookingStatus: "completed",
+    paymentStatus: "paid",
+  })
+
+  if (!completedBooking) {
+    fail("You can review equipment only after a completed paid rental.", 403)
+  }
+
+  const review = {
+    equipmentId: item._id,
+    customerId: user.id,
+    customerName: user.name,
+    rating,
+    comment,
+    createdAt: now(),
+  }
+
+  await reviewsCollection().updateOne(
+    {
+      equipmentId: item._id,
+      customerId: user.id,
+    },
+    {
+      $set: review,
+    },
+    {
+      upsert: true,
+    }
+  )
+
+  const stats = await reviewsCollection()
+    .aggregate([
+      {
+        $match: {
+          equipmentId: item._id,
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          average: {
+            $avg: "$rating",
+          },
+          count: {
+            $sum: 1,
+          },
+        },
+      },
+    ])
+    .toArray()
+
+  await equipmentCollection().updateOne(
+    { _id: item._id },
+    {
+      $set: {
+        averageRating: Number((stats[0]?.average ?? 0).toFixed(2)),
+        reviewCount: stats[0]?.count ?? 0,
+      },
+    }
+  )
+
+  send(res, review, "Review submitted.", 201);
+}))
+
+app.get("/api/equipment/:id/reviews", asyncHandler(async (req, res) => {
+  const equipmentId =
+    typeof req.params.id === "string"
+      ? req.params.id
+      : ""
+
+  if (!equipmentId.trim()) {
+    fail("Invalid equipment ID.", 400, "INVALID_ID")
+  }
+
+  const id = asObjectId(equipmentId, "equipment id")
+
+  const page = Math.max(
+    1,
+    Number(req.query.page ?? 1) || 1
+  )
+
+  const limit = Math.min(
+    50,
+    Math.max(1, Number(req.query.limit ?? 10) || 10)
+  )
+
+  const [items, total] = await Promise.all([
+    reviewsCollection()
+      .find({ equipmentId: id })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+
+    reviewsCollection().countDocuments({
+      equipmentId: id,
+    }),
+  ])
+
+  send(res, {
+    items,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  })
 }))
 
 
