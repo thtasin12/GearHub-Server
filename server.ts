@@ -4845,6 +4845,185 @@ app.post("/api/extensions/:id/checkout", verifyToken, verifyRenter, asyncHandler
 
 
 
+app.post("/api/bookings/:id/handover", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const bookingId =
+    typeof req.params.id === "string"
+      ? req.params.id
+      : ""
+
+  if (!bookingId.trim()) {
+    return fail("Invalid booking ID.", 400, "INVALID_ID")
+  }
+
+  const booking = await bookingById(bookingId)
+
+  await assertBookingParticipant(booking, user)
+
+  const rawBody: unknown = req.body
+
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    return fail("Invalid handover data.")
+  }
+
+  const body = rawBody as Record<string, unknown>
+
+  const rawStage: unknown = body.stage
+  const allowedStages: string[] = ["pickup", "return"]
+
+  if (
+    typeof rawStage !== "string" ||
+    !allowedStages.includes(rawStage)
+  ) {
+    return fail("Invalid handover stage.")
+  }
+
+  const stage = rawStage as "pickup" | "return"
+
+  if (stage === "pickup" && user.id !== booking.ownerId) {
+    return fail("Only the equipment owner can submit pickup handover.", 403)
+  }
+
+  if (stage === "return" && user.id !== booking.customerId) {
+    return fail("Only the customer can submit return handover.", 403)
+  }
+
+  if (booking.paymentStatus !== "paid") {
+    return fail("Paid booking required for handover.", 409)
+  }
+
+  const rawCondition: unknown = body.condition
+
+  const allowedConditions: string[] = [
+    "excellent",
+    "good",
+    "fair",
+    "damaged",
+  ]
+
+  if (
+    typeof rawCondition !== "string" ||
+    !allowedConditions.includes(rawCondition)
+  ) {
+    return fail("Invalid equipment condition.")
+  }
+
+  const condition = rawCondition as
+    | "excellent"
+    | "good"
+    | "fair"
+    | "damaged"
+
+  const rawPhotos: unknown = body.photos
+
+  const photos: string[] = Array.isArray(rawPhotos)
+    ? rawPhotos
+        .filter(
+          (value: unknown): value is string =>
+            typeof value === "string" &&
+            /^https:\/\//.test(value)
+        )
+        .slice(0, 8)
+    : []
+
+  const record = {
+    bookingId: booking._id,
+    equipmentId: booking.equipmentId,
+    stage,
+    submittedBy: user.id,
+    submittedByName: user.name,
+    condition,
+    notes: cleanText(body.notes, 1500),
+    photos,
+    damageNotes: cleanText(body.damageNotes, 1000),
+    createdAt: now(),
+  }
+
+  const result = await handoversCollection().insertOne(record)
+
+  const recipient =
+    user.id === booking.ownerId
+      ? booking.customerId
+      : booking.ownerId
+
+  await notify(
+    recipient,
+    "handover",
+    `${stage === "pickup" ? "Pickup" : "Return"} report submitted`,
+    `${user.name} submitted an equipment ${stage} report.`
+  )
+
+  send(
+    res,
+    {
+      ...record,
+      _id: result.insertedId,
+    },
+    "Handover record saved.",
+    201
+  )
+}))
+
+app.get("/api/bookings/:id/tracking", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const bookingId =
+    typeof req.params.id === "string"
+      ? req.params.id
+      : ""
+
+  if (!bookingId.trim()) {
+    return fail("Invalid booking ID.", 400, "INVALID_ID")
+  }
+
+  const booking = await bookingById(bookingId)
+
+  await assertBookingParticipant(booking, user)
+
+  const [payments, handovers, extensions] = await Promise.all([
+    paymentsCollection()
+      .find({ bookingId: booking._id })
+      .sort({ createdAt: 1 })
+      .toArray(),
+
+    handoversCollection()
+      .find({ bookingId: booking._id })
+      .sort({ createdAt: 1 })
+      .toArray(),
+
+    extensionsCollection()
+      .find({ bookingId: booking._id })
+      .sort({ createdAt: -1 })
+      .toArray(),
+  ])
+
+  send(res, {
+    booking,
+    payments,
+    handovers,
+    extensions,
+    timeline: [
+      {
+        label: "Booking created",
+        at: booking.createdAt,
+      },
+      ...(booking.paidAt
+        ? [{ label: "Payment completed", at: booking.paidAt }]
+        : []),
+      ...(booking.completedAt
+        ? [{ label: "Rental completed", at: booking.completedAt }]
+        : []),
+    ],
+  })
+}))
+
+
+
 app.get("/health", asyncHandler(async (_req, res) => {
   await db.command({ ping: 1 });
 
