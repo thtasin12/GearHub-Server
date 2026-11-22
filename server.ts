@@ -2751,6 +2751,169 @@ app.delete("/api/favorites/:equipmentId", verifyToken, verifyRenter, asyncHandle
   send(res, null, "Removed from favorites.")
 }))
 
+app.get("/api/profile", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const profile = await userCollection().findOne(
+    { email: user.email },
+    {
+      projection: {
+        name: 1,
+        email: 1,
+        image: 1,
+        role: 1,
+        phone: 1,
+        address: 1,
+        createdAt: 1,
+        emailVerified: 1,
+      },
+    }
+  )
+
+  if (!profile) {
+    fail("Profile not found.", 404)
+  }
+
+  send(res, profile)
+}))
+
+app.patch("/api/profile", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+  const rawBody: unknown = req.body
+
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    fail("Invalid profile data.")
+  }
+
+  const body = rawBody as Record<string, unknown>
+
+  const allowedFields = ["name", "image", "phone", "address"]
+
+  for (const key of Object.keys(body)) {
+    if (!allowedFields.includes(key)) {
+      fail(`Cannot update profile field: ${key}`)
+    }
+  }
+
+  const updates: AnyDoc = {}
+
+  // Validate name
+  if ("name" in body) {
+    const rawName: unknown = body.name
+
+    if (typeof rawName !== "string") {
+      return fail("Name must be a string.")
+    }
+
+    const name = (rawName as string).trim()
+
+    if (name.length < 2 || name.length > 100) {
+      fail("Name must be between 2 and 100 characters.");
+    }
+
+    updates.name = name
+  }
+
+  // Validate image URL
+  if ("image" in body) {
+    const rawImage: unknown = body.image;
+
+    if (rawImage === null) {
+      updates.image = null
+    } else {
+      if (
+        typeof rawImage !== "string" ||
+        rawImage.length > 2000
+      ) {
+        return fail("Invalid profile image URL.")
+      }
+
+      let imageProtocol: string | undefined
+
+      try {
+        imageProtocol = new URL(rawImage as string).protocol
+      } catch {
+        return fail("Invalid profile image URL.")
+      }
+
+      if (
+        !imageProtocol ||
+        !["http:", "https:"].includes(imageProtocol)
+      ) {
+        fail("Profile image must use HTTP or HTTPS.")
+      }
+
+      updates.image = rawImage as string
+    }
+  }
+
+  if ("phone" in body) {
+    const rawPhone: unknown = body.phone;
+
+    if (
+      typeof rawPhone !== "string" ||
+      rawPhone.trim().length > 30
+    ) {
+      return fail("Phone must be a string with at most 30 characters.")
+    }
+
+    updates.phone = (rawPhone as string).trim()
+  }
+
+  if ("address" in body) {
+    const rawAddress: unknown = body.address
+
+    if (
+      typeof rawAddress !== "string" ||
+      rawAddress.trim().length > 500
+    ) {
+      return fail("Address must be a string with at most 500 characters.")
+    }
+
+    updates.address = (rawAddress as string).trim()
+  }
+
+  if (Object.keys(updates).length === 0) {
+    fail("No profile fields provided.")
+  }
+
+  const result = await userCollection().updateOne(
+    { email: user.email },
+    {
+      $set: {
+        ...updates,
+        updatedAt: now(),
+      },
+    }
+  )
+
+  if (!result.matchedCount) {
+    fail("Profile not found.", 404);
+  }
+
+  const updatedProfile = await userCollection().findOne(
+    { email: user.email },
+    {
+      projection: {
+        name: 1,
+        email: 1,
+        image: 1,
+        role: 1,
+        phone: 1,
+        address: 1,
+        createdAt: 1,
+        emailVerified: 1,
+      },
+    }
+  )
+
+  send(res, updatedProfile, "Profile updated.")
+}))
 
 
 app.get("/health", asyncHandler(async (_req, res) => {
