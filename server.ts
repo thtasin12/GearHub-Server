@@ -1409,7 +1409,7 @@ app.get(
   "/api/equipment/:id",
   asyncHandler(async (req, res) => {
     const id = req.params.id
-    
+
     if (typeof id !== "string") {
       fail("Invalid equipment ID.", 400, "INVALID_ID")
     }
@@ -1467,6 +1467,269 @@ app.get(
     })
   })
 )
+
+
+// 1. Create new equipment
+app.post("/api/equipment", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
+  const rawBody: unknown = req.body;
+
+  if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+    fail("Invalid equipment data.");
+  }
+
+  const body = rawBody as AnyDoc;
+
+  const rawLocation: unknown = body.location;
+
+  if (!rawLocation || typeof rawLocation !== "object" || Array.isArray(rawLocation)) {
+    fail("Equipment location is required.");
+  }
+
+  const locationInput = rawLocation as AnyDoc;
+
+  // Validate description
+  const description = typeof body.description === "string" ? body.description.trim() : "";
+
+  if (description.length < 20 || description.length > 5000) {
+    fail("Description must be between 20 and 5000 characters.");
+  }
+
+  // Validate category
+  const categories = [
+    "Construction Equipment",
+    "Photography Equipment",
+    "Vehicles & Transportation",
+    "Agriculture Equipment",
+    "Electronics",
+    "Event Equipment",
+    "Other",
+  ];
+
+  if (!categories.includes(body.category)) {
+    fail("Invalid equipment category.");
+  }
+
+
+  const city = typeof locationInput.city === "string" ? locationInput.city.trim() : "";
+  const address = typeof locationInput.address === "string" ? locationInput.address.trim() : "";
+
+  const country = locationInput.country === undefined
+    ? "Bangladesh"
+    : typeof locationInput.country === "string"
+      ? locationInput.country.trim()
+      : "";
+
+  if (city.length < 2 || city.length > 100) fail("Invalid city.");
+  if (address.length < 3 || address.length > 250) fail("Invalid address.");
+  if (country.length < 2 || country.length > 100) fail("Invalid country.");
+
+  // Validate coordinates
+  const latitude = locationInput.latitude;
+  const longitude = locationInput.longitude;
+
+  if (latitude !== undefined && (typeof latitude !== "number" || !Number.isFinite(latitude))) {
+    fail("Invalid latitude.");
+  }
+
+  if (longitude !== undefined && (typeof longitude !== "number" || !Number.isFinite(longitude))) {
+    fail("Invalid longitude.");
+  }
+
+  // Validate rental price
+  const rentalPrice = body.rentalPrice;
+
+  if (
+    typeof rentalPrice !== "number" ||
+    !Number.isFinite(rentalPrice) ||
+    rentalPrice <= 0 ||
+    rentalPrice > 100000000
+  ) {
+    fail("Invalid rental price.");
+  }
+
+  // Validate rental type
+  if (!["daily", "weekly", "monthly"].includes(body.rentalType)) {
+    fail("Invalid rental type.");
+  }
+
+  // Validate available quantity
+  const availableQuantity = body.availableQuantity;
+
+  if (
+    !Number.isInteger(availableQuantity) ||
+    availableQuantity < 1 ||
+    availableQuantity > 10000
+  ) {
+    fail("Available quantity must be between 1 and 10000.");
+  }
+
+  const condition = body.condition;
+
+  if (!["New", "Like New", "Good", "Fair"].includes(condition)) {
+    fail("Invalid equipment condition.");
+  }
+
+  // Validate brand and model
+  if (body.brand !== undefined && typeof body.brand !== "string") {
+    fail("Invalid brand.");
+  }
+
+  if (body.model !== undefined && typeof body.model !== "string") {
+    fail("Invalid model.");
+  }
+
+  const brand = typeof body.brand === "string" ? body.brand.trim() : "";
+  const model = typeof body.model === "string" ? body.model.trim() : "";
+
+  if (brand.length > 100 || model.length > 100) {
+    fail("Brand and model must not exceed 100 characters.");
+  }
+
+  const isValidUrl = (value: unknown): value is string => {
+    if (typeof value !== "string") return false;
+
+    try {
+      new URL(value);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  if (!isValidUrl(body.image) || body.image.length > 2000) {
+    fail("A valid equipment image URL is required.");
+  }
+
+  if (body.gallery !== undefined && !Array.isArray(body.gallery)) {
+    fail("Gallery must be an array.");
+  }
+
+  const gallery = Array.isArray(body.gallery) ? body.gallery : [];
+
+  if (gallery.length > 10 || !gallery.every(isValidUrl)) {
+    fail("Gallery can contain up to 10 valid image URLs.");
+  }
+
+  if (body.rentalTerms !== undefined && typeof body.rentalTerms !== "string") {
+    fail("Invalid rental terms.");
+  }
+
+  const rentalTerms = typeof body.rentalTerms === "string"
+    ? body.rentalTerms.trim()
+    : "Please handle the equipment carefully and return it on time.";
+
+  if (rentalTerms.length > 4000) {
+    fail("Rental terms must not exceed 4000 characters.");
+  }
+
+  // Get logged-in owner
+  const user = currentUser(req);
+
+  // Create geographical coordinates
+  const geo = latitude !== undefined && longitude !== undefined
+    ? {
+      type: "Point",
+      coordinates: [longitude, latitude],
+    }
+    : undefined;
+
+  // Prepare equipment record
+  const record = {
+    name,
+    description,
+    category: body.category,
+
+    location: {
+      city,
+      address,
+      country,
+      ...(geo ? { geo } : {}),
+    },
+
+    rentalPrice,
+    rentalType: body.rentalType,
+    availableQuantity,
+    condition,
+    brand,
+    model,
+    image: body.image,
+    gallery,
+    rentalTerms,
+
+    ownerId: user.id,
+    ownerEmail: user.email,
+    ownerName: user.name,
+
+    status: "pending" as EquipmentStatus,
+    averageRating: 0,
+    reviewCount: 0,
+    totalRentals: 0,
+
+    createdAt: now(),
+    updatedAt: now(),
+  };
+
+  // Save equipment in MongoDB
+  const result = await equipmentCollection().insertOne(record);
+
+  send(
+    res,
+    { ...record, _id: result.insertedId },
+    "Equipment submitted for admin approval.",
+    201
+  );
+}));
+
+
+// 2. Get all equipment belonging to the logged-in owner
+app.get("/api/owner/equipment", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+  const page = Math.max(1, Number(req.query.page ?? 1) || 1);
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 20) || 20));
+
+  const [items, total] = await Promise.all([
+    equipmentCollection()
+      .find({ ownerId: user.id })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+
+    equipmentCollection().countDocuments({ ownerId: user.id }),
+  ]);
+
+  send(res, {
+    items,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  });
+}));
+
+
+// 3. Get a specific equipment belonging to the logged-in owner
+app.get("/api/owner/equipment/:id", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+  const equipmentId =
+  typeof req.params.id === "string" ? req.params.id : "";
+
+  const item = await equipmentCollection().findOne({
+    _id: asObjectId(equipmentId, "equipment id"),
+    ownerId: user.id,
+  });
+
+  if (!item) {
+    fail("Equipment not found or not owned by you.", 404);
+  }
+
+  send(res, item);
+}));
+
+
 
 app.get("/health", asyncHandler(async (_req, res) => {
   await db.command({ ping: 1 });
