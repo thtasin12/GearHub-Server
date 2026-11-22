@@ -4371,6 +4371,227 @@ app.post("/api/admin/payments/:paymentId/refund", verifyToken, verifyAdmin, asyn
   )
 }))
 
+app.post("/api/conversations", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+  if (user.role !== "customer") {
+    return fail("Only customers can start a rental conversation.", 403)
+  }
+
+  const rawBody: unknown = req.body;
+
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    return fail("Invalid conversation data.")
+  }
+
+  const body = rawBody as Record<string, unknown>
+
+  const rawEquipmentId: unknown = body.equipmentId
+
+  if (typeof rawEquipmentId !== "string") {
+    return fail("Equipment ID is required.")
+  }
+
+  const equipmentId = (rawEquipmentId as string)
+    .trim()
+    .slice(0, 100)
+
+  if (!equipmentId) {
+    return fail("Equipment ID is required.")
+  }
+
+  const item = await equipmentById(equipmentId)
+
+  if (item.status !== "approved") {
+    return fail("Equipment is not available.", 404)
+  }
+
+  const existing = await conversationsCollection().findOne({
+    equipmentId: item._id,
+    customerId: user.id,
+    ownerId: item.ownerId,
+  })
+
+  if (existing) {
+    return send(res, existing, "Conversation already exists.")
+  }
+
+  const conversation = {
+    equipmentId: item._id,
+    equipmentName: item.name,
+    customerId: user.id,
+    customerName: user.name,
+    ownerId: item.ownerId,
+    ownerName: item.ownerName,
+    participants: [user.id, item.ownerId],
+    lastMessage: "",
+    createdAt: now(),
+    updatedAt: now(),
+  }
+
+  const result = await conversationsCollection().insertOne(conversation)
+
+  send(
+    res,
+    {
+      ...conversation,
+      _id: result.insertedId,
+    },
+    "Conversation created.",
+    201
+  )
+}))
+
+app.get("/api/conversations", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const items = await conversationsCollection()
+    .find({
+      participants: user.id,
+    })
+    .sort({ updatedAt: -1 })
+    .limit(100)
+    .toArray()
+
+  send(res, items)
+}))
+
+app.get("/api/conversations/:id/messages", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const conversationId =
+    typeof req.params.id === "string"
+      ? req.params.id
+      : ""
+
+  if (!conversationId.trim()) {
+    return fail("Invalid conversation ID.", 400, "INVALID_ID")
+  }
+
+  const conversation = await conversationsCollection().findOne({
+    _id: asObjectId(conversationId, "conversation id"),
+    participants: user.id,
+  })
+
+  if (!conversation) {
+    return fail("Conversation not found.", 404)
+  }
+
+  const items = await messagesCollection()
+    .find({
+      conversationId: conversation._id,
+    })
+    .sort({ createdAt: 1 })
+    .limit(500)
+    .toArray()
+
+  send(res, items)
+}))
+
+app.post("/api/conversations/:id/messages", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const conversationId =
+    typeof req.params.id === "string"
+      ? req.params.id
+      : ""
+
+  if (!conversationId.trim()) {
+    return fail("Invalid conversation ID.", 400, "INVALID_ID")
+  }
+
+  const conversation = await conversationsCollection().findOne({
+    _id: asObjectId(conversationId, "conversation id"),
+    participants: user.id,
+  })
+
+  if (!conversation) {
+    return fail("Conversation not found.", 404)
+  }
+
+  const rawBody: unknown = req.body
+
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    return fail("Invalid message data.")
+  }
+
+  const body = rawBody as Record<string, unknown>
+
+  const rawText: unknown = body.text
+
+  if (typeof rawText !== "string") {
+    return fail("Message text is required.")
+  }
+
+  const messageText = (rawText as string)
+    .trim()
+    .slice(0, 3000)
+
+  if (!messageText) {
+    return fail("Message text is required.")
+  }
+
+  const attachments = Array.isArray(body.attachments)
+    ? body.attachments.slice(0, 3)
+    : []
+
+  const message = {
+    conversationId: conversation._id,
+    senderId: user.id,
+    senderName: user.name,
+    text: messageText,
+    attachments,
+    read: false,
+    createdAt: now(),
+  }
+
+  const result = await messagesCollection().insertOne(message)
+
+  await conversationsCollection().updateOne(
+    {
+      _id: conversation._id,
+    },
+    {
+      $set: {
+        lastMessage: messageText.slice(0, 160),
+        updatedAt: now(),
+      },
+    }
+  )
+
+  const recipient =
+    conversation.customerId === user.id
+      ? conversation.ownerId
+      : conversation.customerId
+
+  await notify(
+    recipient,
+    "message",
+    "New GearHub message",
+    `${user.name}: ${messageText.slice(0, 100)}`,
+    `/dashboard/messages/${conversation._id}`
+  )
+
+  send(
+    res,
+    {
+      ...message,
+      _id: result.insertedId,
+    },
+    "Message sent.",
+    201
+  )
+}))
+
+
 
 app.get("/health", asyncHandler(async (_req, res) => {
   await db.command({ ping: 1 });
