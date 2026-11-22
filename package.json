@@ -4,10 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "tsx watch server.ts",
     "build": "tsc",
-    "start": "server.ts",
+    "start": "node dist/server.js",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [],
