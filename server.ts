@@ -4592,6 +4592,258 @@ app.post("/api/conversations/:id/messages", verifyToken, asyncHandler(async (req
 }))
 
 
+app.post("/api/bookings/:id/extensions", verifyToken, verifyRenter, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+
+  const bookingId =
+    typeof req.params.id === "string"
+      ? req.params.id
+      : ""
+
+  if (!bookingId.trim()) {
+    return fail("Invalid booking ID.", 400, "INVALID_ID")
+  }
+
+  const booking = await bookingById(bookingId)
+
+  if (
+    booking.customerId !== user.id ||
+    booking.paymentStatus !== "paid" ||
+    !["confirmed", "in_progress"].includes(booking.bookingStatus)
+  ) {
+    return fail("Only active paid rentals can be extended.", 403)
+  }
+
+  const rawBody: unknown = req.body
+
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    return fail("Invalid extension request.")
+  }
+
+  const body = rawBody as Record<string, unknown>
+
+  const rawNewEndAt: unknown = body.newEndAt
+
+  if (
+    typeof rawNewEndAt !== "string" ||
+    !isValidDate(rawNewEndAt)
+  ) {
+    return fail("New end date must be a valid date.")
+  }
+
+  const newEndAt = toDate(rawNewEndAt as string, "newEndAt")
+
+  if (newEndAt <= new Date(booking.endAt)) {
+    return fail("New end date must be after the current end date.")
+  }
+
+  const item = await equipmentById(String(booking.equipmentId))
+
+  await checkAvailability(
+    item._id,
+    new Date(booking.endAt),
+    newEndAt,
+    Number(booking.requiredQuantity),
+    Number(item.availableQuantity),
+    booking._id
+  )
+  
+  const extra = calculateRental(
+    Number(item.rentalPrice),
+    item.rentalType as RentalType,
+    new Date(booking.endAt),
+    newEndAt,
+    Number(booking.requiredQuantity)
+  )
+  
+  const extension = {
+    bookingId: booking._id,
+    customerId: user.id,
+    ownerId: booking.ownerId,
+    oldEndAt: booking.endAt,
+    newEndAt,
+    amount: extra.total,
+    currency: env.STRIPE_CURRENCY,
+    status: "requested",
+    createdAt: now(),
+  }
+
+  const result = await extensionsCollection().insertOne(extension)
+
+  await notify(
+    booking.ownerId,
+    "extension_request",
+    "Rental extension request",
+    `${user.name} requested extra rental time for ${booking.equipmentName}.`
+  )
+
+  send(
+    res,
+    {
+      ...extension,
+      _id: result.insertedId,
+    },
+    "Extension request sent to the owner.",
+    201
+  )
+}))
+
+
+app.patch("/api/extensions/:id/approve", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+
+  const extensionId =
+    typeof req.params.id === "string"
+      ? req.params.id
+      : ""
+
+  if (!extensionId.trim()) {
+    return fail("Invalid extension ID.", 400, "INVALID_ID")
+  }
+
+  const foundExtension = await extensionsCollection().findOne({
+    _id: asObjectId(extensionId, "extension id"),
+    ownerId: user.id,
+    status: "requested",
+  })
+
+  if (!foundExtension) {
+    return fail("Extension request not found.", 404)
+  }
+
+  const extension = foundExtension as AnyDoc
+
+  await extensionsCollection().updateOne(
+    { _id: extension._id },
+    {
+      $set: {
+        status: "approved",
+        approvedAt: now(),
+      },
+    }
+  )
+
+
+  await notify(
+    extension.customerId,
+    "extension_approved",
+    "Extension approved",
+    "Your rental extension was approved. Complete payment to apply it."
+  )
+
+  send(
+    res,
+    await extensionsCollection().findOne({
+      _id: extension._id,
+    }),
+    "Extension approved. Customer can now pay."
+  )
+}))
+
+app.post("/api/extensions/:id/checkout", verifyToken, verifyRenter, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const extensionId =
+    typeof req.params.id === "string"
+      ? req.params.id
+      : "";
+
+  if (!extensionId.trim()) {
+    return fail("Invalid extension ID.", 400, "INVALID_ID")
+  }
+
+  const foundExtension = await extensionsCollection().findOne({
+    _id: asObjectId(extensionId, "extension id"),
+    customerId: user.id,
+    status: "approved",
+  });
+
+  if (!foundExtension) {
+    return fail("Approved extension not found.", 404)
+  }
+
+  const extension = foundExtension as AnyDoc
+
+  const paymentId = new ObjectId()
+
+
+  const session = await createStripeCheckout({
+    amount: Number(extension.amount),
+    currency: env.STRIPE_CURRENCY,
+    productName: "GearHub rental extension",
+    description: `Extend booking ${extension.bookingId}`,
+    customerEmail: user.email,
+
+    metadata: {
+      kind: "extension",
+      extensionId: String(extension._id),
+      paymentId: String(paymentId),
+      customerId: user.id,
+    },
+
+    idempotencyKey: `gearhub-extension-${extension._id}-${paymentId}`,
+  });
+
+  if (!session.url) {
+    return fail("Stripe did not return a checkout URL.", 502)
+  }
+
+
+  const payment = {
+    _id: paymentId,
+    extensionId: extension._id,
+    bookingId: extension.bookingId,
+    customerId: user.id,
+    ownerId: extension.ownerId,
+
+    stripeSessionId: session.id,
+
+    stripePaymentIntentId:
+      typeof session.payment_intent === "string"
+        ? session.payment_intent
+        : null,
+
+    checkoutUrl: session.url,
+
+    amount: Number(extension.amount),
+
+    amountMinor: toStripeMinorUnits(
+      Number(extension.amount),
+      env.STRIPE_CURRENCY
+    ),
+
+    currency: env.STRIPE_CURRENCY,
+    status: "pending",
+    purpose: "extension",
+
+    createdAt: now(),
+
+    expiresAt: session.expires_at
+      ? new Date(session.expires_at * 1000)
+      : addMinutes(now(), 30),
+  };
+
+
+  await paymentsCollection().insertOne(payment)
+
+  send(
+    res,
+    {
+      checkoutUrl: session.url,
+      sessionId: session.id,
+    },
+    "Extension checkout created.",
+    201
+  )
+}))
+
+
 
 app.get("/health", asyncHandler(async (_req, res) => {
   await db.command({ ping: 1 });
