@@ -2268,6 +2268,125 @@ app.post("/api/bookings", verifyToken, verifyRenter, asyncHandler(async (req, re
   }
 }))
 
+app.get("/api/bookings/my", verifyToken, verifyRenter, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const page = Math.max(
+    1,
+    Number(req.query.page ?? 1) || 1
+  )
+
+  const limit = Math.min(
+    100,
+    Math.max(1, Number(req.query.limit ?? 20) || 20)
+  )
+
+  const [items, total] = await Promise.all([
+    bookingsCollection()
+      .find({ customerId: user.id })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+
+    bookingsCollection().countDocuments({
+      customerId: user.id,
+    }),
+  ])
+
+  send(res, {
+    items,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  })
+}))
+
+
+app.get("/api/bookings/:id", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+  const bookingId =
+    typeof req.params.id === "string" ? req.params.id : ""
+
+  const booking = await bookingById(bookingId)
+
+  await assertBookingParticipant(booking, user)
+
+  const payment = await paymentsCollection()
+    .find({ bookingId: booking._id })
+    .sort({ createdAt: -1 })
+    .limit(5)
+    .toArray()
+
+  send(res, {
+    ...booking,
+    payments: payment,
+  })
+}))
+
+
+app.post("/api/bookings/:id/cancel", verifyToken, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+  const bookingId =
+    typeof req.params.id === "string" ? req.params.id : ""
+
+  const booking = await bookingById(bookingId);
+
+  if (
+    booking.customerId !== user.id &&
+    booking.ownerId !== user.id &&
+    user.role !== "admin"
+  ) {
+    fail("You cannot cancel this booking.", 403);
+  }
+
+  if (
+    ["completed", "cancelled", "expired"].includes(booking.bookingStatus)
+  ) {
+    fail("This booking can no longer be cancelled.", 409);
+  }
+
+  if (booking.paymentStatus === "paid") {
+    fail(
+      "A paid booking must be cancelled through the refund process by an admin.",
+      409
+    )
+  }
+
+  await bookingsCollection().updateOne(
+    { _id: booking._id },
+    {
+      $set: {
+        bookingStatus: "cancelled",
+        cancelledAt: now(),
+        updatedAt: now(),
+      },
+    }
+  )
+
+
+  await notify(
+    booking.customerId,
+    "booking_cancelled",
+    "Booking cancelled",
+    `${booking.equipmentName} booking was cancelled.`
+  )
+
+
+  await notify(
+    booking.ownerId,
+    "booking_cancelled",
+    "Booking cancelled",
+    `${booking.equipmentName} booking was cancelled.`
+  )
+
+  send(res, null, "Booking cancelled.")
+}))
 
 
 app.get("/health", asyncHandler(async (_req, res) => {
@@ -2282,8 +2401,8 @@ app.get("/health", asyncHandler(async (_req, res) => {
       time: now().toISOString(),
     },
     "GearHub API is healthy"
-  );
-}));
+  )
+}))
 
 
 app.all("/api/auth/*", authLimiter, (req, res, next) => {
