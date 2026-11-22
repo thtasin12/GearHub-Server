@@ -1329,6 +1329,145 @@ app.get("/api/equipment", asyncHandler(async (req, res) => {
   })
 }))
 
+
+app.get(
+  "/api/equipment/:id/availability",
+  asyncHandler(async (req, res) => {
+    const id = req.params.id;
+
+    if (typeof id !== "string") {
+      fail("Invalid equipment ID.", 400, "INVALID_ID")
+    }
+
+    const equipmentId = req.params.id;
+
+    if (typeof equipmentId !== "string") {
+      throw new AppError("Invalid equipment ID.", 400, "INVALID_ID")
+    }
+
+    const item = await equipmentById(equipmentId)
+    if (item.status !== "approved") {
+      fail("Equipment is not available.", 404)
+    }
+
+    const from = toDate(
+      String(req.query.from ?? ""),
+      "from"
+    )
+
+    const to = toDate(
+      String(req.query.to ?? ""),
+      "to"
+    )
+
+    if (to <= from) {
+      fail("The end date must be after the start date.")
+    }
+
+    const reservations = await bookingsCollection()
+      .find(
+        {
+          equipmentId: item._id,
+          $and: [
+            {
+              $or: [
+                {
+                  bookingStatus: {
+                    $in: ["confirmed", "in_progress"],
+                  },
+                },
+                {
+                  bookingStatus: "pending_payment",
+                  holdExpiresAt: { $gt: now() },
+                },
+              ],
+            },
+            { startAt: { $lt: to } },
+            { endAt: { $gt: from } },
+          ],
+        },
+        {
+          projection: {
+            startAt: 1,
+            endAt: 1,
+            requiredQuantity: 1,
+            bookingStatus: 1,
+          },
+        }
+      )
+      .sort({ startAt: 1 })
+      .toArray()
+
+    send(res, {
+      capacity: item.availableQuantity,
+      reservations,
+    })
+  })
+)
+
+app.get(
+  "/api/equipment/:id",
+  asyncHandler(async (req, res) => {
+    const id = req.params.id
+    
+    if (typeof id !== "string") {
+      fail("Invalid equipment ID.", 400, "INVALID_ID")
+    }
+
+    const equipmentId = req.params.id
+
+    if (typeof equipmentId !== "string") {
+      throw new AppError("Invalid equipment ID.", 400, "INVALID_ID")
+    }
+
+    const item = await equipmentById(equipmentId)
+
+    if (item.status !== "approved") {
+      const user = (req as AuthRequest).authUser
+
+      if (
+        !user ||
+        (user.role !== "admin" && user.id !== item.ownerId)
+      ) {
+        fail("Equipment not found.", 404)
+      }
+    }
+
+    const [owner, reviews] = await Promise.all([
+      userCollection().findOne(
+        { email: item.ownerEmail },
+        {
+          projection: {
+            name: 1,
+            image: 1,
+            email: 1,
+            createdAt: 1,
+          },
+        }
+      ),
+
+      reviewsCollection()
+        .find({ equipmentId: item._id })
+        .sort({ createdAt: -1 })
+        .limit(10)
+        .toArray(),
+    ]);
+
+    send(res, {
+      ...item,
+      owner: owner
+        ? {
+          name: owner.name,
+          image: owner.image,
+          email: owner.email,
+          memberSince: owner.createdAt,
+        }
+        : null,
+      reviews,
+    })
+  })
+)
+
 app.get("/health", asyncHandler(async (_req, res) => {
   await db.command({ ping: 1 });
 
