@@ -354,8 +354,6 @@ const currentUser = (req: Request): AuthUser => {
   return user!;
 }
 
-/* --------------------------- Helper functions --------------------------- */
-
 function calculateRental(
   price: number,
   rentalType: RentalType,
@@ -376,13 +374,13 @@ function calculateRental(
       ? days
       : rentalType === "weekly"
         ? Math.ceil(days / 7)
-        : Math.ceil(days / 30);
+        : Math.ceil(days / 30)
 
   const unitPrice = Number(price);
   const total = Number((unitPrice * periods * quantity).toFixed(2));
 
   if (!Number.isFinite(total) || total <= 0) {
-    fail("Could not calculate rental amount.", 400);
+    fail("Could not calculate rental amount.", 400)
   }
 
   return { days, periods, rentalType, unitPrice, quantity, total };
@@ -393,11 +391,11 @@ function toStripeMinorUnits(amount: number, currency: string) {
     "bif", "clp", "djf", "gnf", "jpy", "kmf", "krw",
     "mga", "pyg", "rwf", "ugx", "vnd", "vuv", "xaf",
     "xof", "xpf",
-  ]);
+  ])
 
   return Math.round(
     amount * (zeroDecimal.has(currency.toLowerCase()) ? 1 : 100)
-  );
+  )
 }
 
 function requireStripe(): Stripe {
@@ -406,7 +404,7 @@ function requireStripe(): Stripe {
       "Stripe is not configured. Add STRIPE_SECRET_KEY to the server environment.",
       503,
       "STRIPE_NOT_CONFIGURED"
-    );
+    )
   }
 
   return stripe as Stripe;
@@ -427,31 +425,31 @@ async function notify(
     link,
     read: false,
     createdAt: now(),
-  });
+  })
 }
 
 async function equipmentById(id: string): Promise<AnyDoc> {
   const item = await equipmentCollection().findOne({
     _id: asObjectId(id, "equipment id"),
-  });
+  })
 
   if (!item) {
     fail("Equipment not found.", 404, "EQUIPMENT_NOT_FOUND");
   }
 
-  return item!;
+  return item!
 }
 
 async function bookingById(id: string): Promise<AnyDoc> {
   const booking = await bookingsCollection().findOne({
     _id: asObjectId(id, "booking id"),
-  });
+  })
 
   if (!booking) {
     fail("Booking not found.", 404, "BOOKING_NOT_FOUND");
   }
 
-  return booking!;
+  return booking!
 }
 
 async function assertBookingParticipant(
@@ -464,7 +462,7 @@ async function assertBookingParticipant(
     booking.customerId !== user.id &&
     booking.ownerId !== user.id
   ) {
-    fail("You cannot access this booking.", 403);
+    fail("You cannot access this booking.", 403)
   }
 }
 
@@ -630,6 +628,8 @@ async function getEquipmentAvailability(
     ),
   }
 }
+
+
 
 
 
@@ -820,6 +820,39 @@ let JWKS: ReturnType<typeof createRemoteJWKSet> = undefined as any
 
 const mongoClient = new MongoClient(env.MONGODB_URI, {
   serverSelectionTimeoutMS: 15000
+})
+
+app.get("/health", asyncHandler(async (_req, res) => {
+  await db.command({ ping: 1 });
+
+  send(
+    res,
+    {
+      status: "ok",
+      database: "connected",
+      stripeConfigured: Boolean(stripe),
+      time: now().toISOString(),
+    },
+    "GearHub API is healthy"
+  );
+}));
+
+
+app.all("/api/auth/*", authLimiter, (req, res, next) => {
+  if (!betterAuthHandler) {
+    return next(
+      new AppError(
+        "Authentication service is starting. Retry shortly.",
+        503
+      )
+    )
+  }
+
+  try {
+    betterAuthHandler(req, res)
+  } catch (error) {
+    next(error)
+  }
 })
 
 
