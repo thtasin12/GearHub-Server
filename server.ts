@@ -3191,6 +3191,226 @@ app.patch("/api/notifications/read-all", verifyToken, asyncHandler(async (req, r
 }))
 
 
+/* -------------------------- Owner/Admin analytics ----------------------- */
+
+// Owner dashboard analytics
+app.get("/api/owner/analytics", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+  // Get owner's equipment IDs
+  const ownerEquipment = await equipmentCollection().find(
+    { ownerId: user.id },
+    { projection: { _id: 1 } }
+  ).toArray();
+
+  const equipmentIds = ownerEquipment.map((item) => item._id);
+
+  // Fetch owner statistics
+  const [
+    totalEquipment,
+    completedRentals,
+    earnings,
+    monthly,
+  ] = await Promise.all([
+    // Total equipment
+    equipmentCollection().countDocuments({
+      ownerId: user.id,
+    }),
+
+    // Completed rentals
+    bookingsCollection().countDocuments({
+      ownerId: user.id,
+      bookingStatus: "completed",
+    }),
+
+    // Total earnings
+    paymentsCollection().aggregate([
+      {
+        $match: {
+          ownerId: user.id,
+          status: "paid",
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          total: {
+            $sum: "$amount",
+          },
+        },
+      },
+    ]).toArray(),
+
+    // Monthly earnings for the last six calendar months
+    paymentsCollection().aggregate([
+      {
+        $match: {
+          ownerId: user.id,
+          status: "paid",
+          createdAt: {
+            $gte: new Date(
+              new Date().getFullYear(),
+              new Date().getMonth() - 5,
+              1
+            ),
+          },
+        },
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: "$createdAt" },
+            month: { $month: "$createdAt" },
+          },
+          earnings: {
+            $sum: "$amount",
+          },
+          bookings: {
+            $sum: 1,
+          },
+        },
+      },
+      {
+        $sort: {
+          "_id.year": 1,
+          "_id.month": 1,
+        },
+      },
+    ]).toArray(),
+  ]);
+
+  send(res, {
+    totalEquipment,
+    completedRentals,
+    totalEarnings: earnings[0]?.total ?? 0,
+    monthlyEarnings: monthly,
+    equipmentIds: equipmentIds.map((id) => String(id)),
+  })
+}))
+
+
+app.get("/api/admin/analytics", verifyToken, verifyAdmin, asyncHandler(async (_req, res) => {
+
+  const [
+    totalUsers,
+    totalEquipment,
+    totalBookings,
+    pendingApprovals,
+    completedRentals,
+    revenue,
+    monthlyBookings,
+    monthlyRevenue,
+  ] = await Promise.all([
+
+    userCollection().countDocuments({}),
+
+    equipmentCollection().countDocuments({}),
+
+    bookingsCollection().countDocuments({}),
+
+    equipmentCollection().countDocuments({
+      status: "pending",
+    }),
+
+    bookingsCollection().countDocuments({
+      bookingStatus: "completed",
+    }),
+
+    paymentsCollection().aggregate([
+      {
+        $match: {
+          status: "paid",
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          total: {
+            $sum: "$amount",
+          },
+        },
+      },
+    ]).toArray(),
+
+    bookingsCollection().aggregate([
+      {
+        $match: {
+          createdAt: {
+            $gte: new Date(
+              new Date().getFullYear(),
+              new Date().getMonth() - 5,
+              1
+            ),
+          },
+        },
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: "$createdAt" },
+            month: { $month: "$createdAt" },
+          },
+          bookings: {
+            $sum: 1,
+          },
+        },
+      },
+      {
+        $sort: {
+          "_id.year": 1,
+          "_id.month": 1,
+        },
+      },
+    ]).toArray(),
+
+    paymentsCollection().aggregate([
+      {
+        $match: {
+          status: "paid",
+          createdAt: {
+            $gte: new Date(
+              new Date().getFullYear(),
+              new Date().getMonth() - 5,
+              1
+            ),
+          },
+        },
+      },
+      {
+        $group: {
+          _id: {
+            year: { $year: "$createdAt" },
+            month: { $month: "$createdAt" },
+          },
+          revenue: {
+            $sum: "$amount",
+          },
+        },
+      },
+      {
+        $sort: {
+          "_id.year": 1,
+          "_id.month": 1,
+        },
+      },
+    ]).toArray(),
+  ])
+
+  send(res, {
+    totalUsers,
+    totalEquipment,
+    totalBookings,
+    pendingApprovals,
+    completedRentals,
+    totalRevenue: revenue[0]?.total ?? 0,
+    currency: env.STRIPE_CURRENCY,
+    monthlyBookings,
+    monthlyRevenue,
+  })
+}))
+
+
+
 app.get("/health", asyncHandler(async (_req, res) => {
   await db.command({ ping: 1 });
 
