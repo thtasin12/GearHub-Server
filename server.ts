@@ -4180,6 +4180,196 @@ app.delete("/api/admin/equipment/:id", verifyToken, verifyAdmin, asyncHandler(as
   send(res, null, "Equipment deleted.")
 }))
 
+app.get("/api/admin/bookings", verifyToken, verifyAdmin, asyncHandler(async (req, res) => {
+
+  const rawStatus: unknown = req.query.status
+
+  const status =
+    typeof rawStatus === "string"
+      ? rawStatus.trim()
+      : ""
+
+  const filter: AnyDoc = {}
+
+  if (status) {
+    const allowedStatuses = [
+      "pending_payment",
+      "confirmed",
+      "in_progress",
+      "completed",
+      "cancelled",
+      "expired",
+      "payment_failed",
+    ]
+
+    if (!allowedStatuses.includes(status)) {
+      return fail("Invalid booking status.")
+    }
+
+    filter.bookingStatus = status
+  }
+
+  const items = await bookingsCollection()
+    .find(filter)
+    .sort({ createdAt: -1 })
+    .limit(300)
+    .toArray()
+
+  send(res, items)
+}))
+
+app.patch("/api/admin/bookings/:id/status", verifyToken, verifyAdmin, asyncHandler(async (req, res) => {
+
+  const bookingId =
+    typeof req.params.id === "string"
+      ? req.params.id
+      : "";
+
+  if (!bookingId.trim()) {
+    return fail("Invalid booking ID.", 400, "INVALID_ID")
+  }
+
+  const rawBody: unknown = req.body
+
+  if (
+    !rawBody ||
+    typeof rawBody !== "object" ||
+    Array.isArray(rawBody)
+  ) {
+    return fail("Invalid booking status data.")
+  }
+
+  const body = rawBody as Record<string, unknown>
+
+  const rawStatus: unknown = body.status
+
+  const allowedStatuses = [
+    "confirmed",
+    "in_progress",
+    "completed",
+    "cancelled",
+  ]
+
+  if (
+    typeof rawStatus !== "string" ||
+    !allowedStatuses.includes(rawStatus)
+  ) {
+    return fail("Invalid booking status.")
+  }
+
+  const status = rawStatus as
+    | "confirmed"
+    | "in_progress"
+    | "completed"
+    | "cancelled"
+
+  const booking = await bookingById(bookingId)
+
+  if (
+    status === "confirmed" &&
+    booking.paymentStatus !== "paid"
+  ) {
+    return fail("Cannot confirm an unpaid booking.", 409)
+  }
+
+  await bookingsCollection().updateOne(
+    { _id: booking._id },
+    {
+      $set: {
+        bookingStatus: status,
+        updatedAt: now(),
+        ...(status === "completed"
+          ? { completedAt: now() }
+          : {}),
+      },
+    }
+  )
+
+  await notify(
+    booking.customerId,
+    "booking_admin_update",
+    "Booking updated",
+    `Admin changed your booking to ${status}.`
+  )
+
+  await notify(
+    booking.ownerId,
+    "booking_admin_update",
+    "Booking updated",
+    `Admin changed a rental booking to ${status}.`
+  )
+
+  send(
+    res,
+    await bookingsCollection().findOne({
+      _id: booking._id,
+    })
+  )
+}))
+
+app.post("/api/admin/payments/:paymentId/refund", verifyToken, verifyAdmin, asyncHandler(async (req, res) => {
+
+  const paymentId =
+    typeof req.params.paymentId === "string"
+      ? req.params.paymentId
+      : ""
+
+  if (!paymentId.trim()) {
+    return fail("Invalid payment ID.", 400, "INVALID_ID")
+  }
+
+  const payment = await paymentsCollection().findOne({
+    _id: asObjectId(paymentId, "payment id"),
+  })
+
+  if (!payment) {
+    return fail("Paid Stripe payment not found or not refundable.", 404)
+  }
+
+  if (
+    payment.status !== "paid" ||
+    !payment.stripePaymentIntentId
+  ) {
+    return fail("Paid Stripe payment not found or not refundable.", 404)
+  }
+
+  const refund = await requireStripe().refunds.create({
+    payment_intent: payment.stripePaymentIntentId,
+    reason: "requested_by_customer",
+  })
+
+  await paymentsCollection().updateOne(
+    { _id: payment._id },
+    {
+      $set: {
+        status: "refunded",
+        stripeRefundId: refund.id,
+        refundedAt: now(),
+        updatedAt: now(),
+      },
+    }
+  )
+
+  await bookingsCollection().updateOne(
+    { _id: payment.bookingId },
+    {
+      $set: {
+        paymentStatus: "refunded",
+        bookingStatus: "cancelled",
+        updatedAt: now(),
+      },
+    }
+  )
+
+  send(
+    res,
+    {
+      refundId: refund.id,
+      status: refund.status,
+    },
+    "Refund requested from Stripe."
+  )
+}))
 
 
 app.get("/health", asyncHandler(async (_req, res) => {
