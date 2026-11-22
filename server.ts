@@ -16,6 +16,7 @@ import {
 import helmet from "helmet"
 import rateLimit from "express-rate-limit"
 
+
 import { betterAuth } from "better-auth"
 import { mongodbAdapter } from "@better-auth/mongo-adapter"
 import { jwt } from "better-auth/plugins"
@@ -26,8 +27,11 @@ import {
   jwtVerify,
   type JWTPayload,
 } from "jose"
+import Stripe from "stripe";
+dotenv.config();
 
 let db!: Db;
+
 
 
 type Role = "customer" | "owner" | "admin";
@@ -348,7 +352,284 @@ const currentUser = (req: Request): AuthUser => {
   }
 
   return user!;
-};
+}
+
+/* --------------------------- Helper functions --------------------------- */
+
+function calculateRental(
+  price: number,
+  rentalType: RentalType,
+  startAt: Date,
+  endAt: Date,
+  quantity: number
+) {
+  const durationMs = endAt.getTime() - startAt.getTime();
+
+  if (durationMs <= 0) {
+    fail("Rental end date must be after the start date.", 400, "INVALID_RENTAL_DATES");
+  }
+
+  const days = Math.max(1, Math.ceil(durationMs / 86_400_000));
+
+  const periods =
+    rentalType === "daily"
+      ? days
+      : rentalType === "weekly"
+        ? Math.ceil(days / 7)
+        : Math.ceil(days / 30);
+
+  const unitPrice = Number(price);
+  const total = Number((unitPrice * periods * quantity).toFixed(2));
+
+  if (!Number.isFinite(total) || total <= 0) {
+    fail("Could not calculate rental amount.", 400);
+  }
+
+  return { days, periods, rentalType, unitPrice, quantity, total };
+}
+
+function toStripeMinorUnits(amount: number, currency: string) {
+  const zeroDecimal = new Set([
+    "bif", "clp", "djf", "gnf", "jpy", "kmf", "krw",
+    "mga", "pyg", "rwf", "ugx", "vnd", "vuv", "xaf",
+    "xof", "xpf",
+  ]);
+
+  return Math.round(
+    amount * (zeroDecimal.has(currency.toLowerCase()) ? 1 : 100)
+  );
+}
+
+function requireStripe(): Stripe {
+  if (!stripe) {
+    fail(
+      "Stripe is not configured. Add STRIPE_SECRET_KEY to the server environment.",
+      503,
+      "STRIPE_NOT_CONFIGURED"
+    );
+  }
+
+  return stripe as Stripe;
+}
+
+async function notify(
+  userId: string,
+  type: string,
+  title: string,
+  message: string,
+  link = ""
+) {
+  await notificationsCollection().insertOne({
+    userId,
+    type,
+    title,
+    message,
+    link,
+    read: false,
+    createdAt: now(),
+  });
+}
+
+async function equipmentById(id: string): Promise<AnyDoc> {
+  const item = await equipmentCollection().findOne({
+    _id: asObjectId(id, "equipment id"),
+  });
+
+  if (!item) {
+    fail("Equipment not found.", 404, "EQUIPMENT_NOT_FOUND");
+  }
+
+  return item!;
+}
+
+async function bookingById(id: string): Promise<AnyDoc> {
+  const booking = await bookingsCollection().findOne({
+    _id: asObjectId(id, "booking id"),
+  });
+
+  if (!booking) {
+    fail("Booking not found.", 404, "BOOKING_NOT_FOUND");
+  }
+
+  return booking!;
+}
+
+async function assertBookingParticipant(
+  booking: AnyDoc,
+  user: AuthUser
+) {
+  if (user.role === "admin") return;
+
+  if (
+    booking.customerId !== user.id &&
+    booking.ownerId !== user.id
+  ) {
+    fail("You cannot access this booking.", 403);
+  }
+}
+
+async function createStripeCheckout(params: {
+  amount: number;
+  currency?: string;
+  productName: string;
+  description: string;
+  customerEmail: string;
+  metadata: Record<string, string>;
+  successUrl?: string;
+  cancelUrl?: string;
+  idempotencyKey: string;
+}) {
+  const stripeClient = requireStripe();
+
+  const currency = (
+    params.currency ?? env.STRIPE_CURRENCY
+  ).toLowerCase();
+
+  const amountMinor = toStripeMinorUnits(
+    params.amount,
+    currency
+  );
+
+  if (amountMinor < 1) {
+    fail("Payment amount is below Stripe's minimum.", 400);
+  }
+
+  return stripeClient.checkout.sessions.create(
+    {
+      mode: "payment",
+      customer_email: params.customerEmail,
+      line_items: [
+        {
+          quantity: 1,
+          price_data: {
+            currency,
+            unit_amount: amountMinor,
+            product_data: {
+              name: params.productName,
+              description: params.description.slice(0, 500),
+            },
+          },
+        },
+      ],
+      metadata: params.metadata,
+      success_url: params.successUrl ?? env.STRIPE_SUCCESS_URL,
+      cancel_url: params.cancelUrl ?? env.STRIPE_CANCEL_URL,
+      billing_address_collection: "auto",
+    },
+    { idempotencyKey: params.idempotencyKey }
+  );
+}
+
+async function checkAvailability(
+  equipmentId: ObjectId,
+  startAt: Date,
+  endAt: Date,
+  requestedQuantity: number,
+  capacity: number,
+  excludeBookingId?: ObjectId
+) {
+  const overlapQuery: AnyDoc = {
+    equipmentId,
+    $and: [
+      {
+        $or: [
+          {
+            bookingStatus: {
+              $in: ["confirmed", "in_progress"],
+            },
+          },
+          {
+            bookingStatus: "pending_payment",
+            holdExpiresAt: { $gt: now() },
+          },
+        ],
+      },
+      { startAt: { $lt: endAt } },
+      { endAt: { $gt: startAt } },
+    ],
+  }
+
+  if (excludeBookingId) {
+    overlapQuery._id = { $ne: excludeBookingId };
+  }
+
+  const result = await bookingsCollection()
+    .aggregate([
+      { $match: overlapQuery },
+      {
+        $group: {
+          _id: null,
+          reserved: { $sum: "$requiredQuantity" },
+        },
+      },
+    ])
+    .toArray()
+
+  const reserved = Number(result[0]?.reserved ?? 0)
+  const remaining = Math.max(0, capacity - reserved)
+
+  if (requestedQuantity > remaining) {
+    fail(
+      `Only ${remaining} unit(s) are available for the selected rental period.`,
+      409,
+      "INSUFFICIENT_AVAILABILITY"
+    )
+  }
+
+  return {
+    reserved,
+    remaining: remaining - requestedQuantity,
+  }
+}
+
+async function getEquipmentAvailability(
+  item: AnyDoc,
+  startAt: Date,
+  endAt: Date
+) {
+  const result = await bookingsCollection()
+    .aggregate([
+      {
+        $match: {
+          equipmentId: item._id,
+          $and: [
+            {
+              $or: [
+                {
+                  bookingStatus: {
+                    $in: ["confirmed", "in_progress"],
+                  },
+                },
+                {
+                  bookingStatus: "pending_payment",
+                  holdExpiresAt: { $gt: now() },
+                },
+              ],
+            },
+            { startAt: { $lt: endAt } },
+            { endAt: { $gt: startAt } },
+          ],
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          reserved: { $sum: "$requiredQuantity" },
+        },
+      },
+    ])
+    .toArray()
+
+  const reserved = Number(result[0]?.reserved ?? 0);
+
+  return {
+    reserved,
+    remaining: Math.max(
+      0,
+      Number(item.availableQuantity) - reserved
+    ),
+  }
+}
 
 
 
@@ -448,6 +729,15 @@ const env = {
   ).replace(/\/$/, ""),
   GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID ?? "",
   GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET ?? "",
+  STRIPE_SECRET_KEY: process.env.STRIPE_SECRET_KEY ?? "",
+  STRIPE_WEBHOOK_SECRET: process.env.STRIPE_WEBHOOK_SECRET ?? "",
+  STRIPE_CURRENCY: (process.env.STRIPE_CURRENCY ?? "bdt").toLowerCase(),
+  STRIPE_SUCCESS_URL:
+    process.env.STRIPE_SUCCESS_URL ??
+    "http://localhost:3000/payment/success?session_id={CHECKOUT_SESSION_ID}",
+  STRIPE_CANCEL_URL:
+    process.env.STRIPE_CANCEL_URL ??
+    "http://localhost:3000/payment/cancel",
 };
 
 if (env.BETTER_AUTH_SECRET.length < 32) {
@@ -455,6 +745,10 @@ if (env.BETTER_AUTH_SECRET.length < 32) {
 }
 
 const app = express();
+
+const stripe: Stripe | null = env.STRIPE_SECRET_KEY.startsWith("sk_")
+  ? new Stripe(env.STRIPE_SECRET_KEY)
+  : null;
 
 //Middleware
 const allowedOrigins = new Set([
