@@ -789,7 +789,7 @@ const corsOptions: CorsOptions = {
 
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
-app.use(express.json())
+
 
 app.use(
   helmet({
@@ -822,6 +822,25 @@ let auth: ReturnType<typeof betterAuth> = undefined as any;
 let betterAuthHandler:
   | ((req: Request, res: Response) => void)
   | undefined;
+
+
+
+app.all("/api/auth/{*splat}", authLimiter, (req, res, next) => {
+  if (!betterAuthHandler) {
+    return next(
+      new AppError(
+        "Authentication service is starting. Retry shortly.",
+        503
+      )
+    )
+  }
+
+  try {
+    betterAuthHandler(req, res)
+  } catch (error) {
+    next(error)
+  }
+})
 
 
 let JWKS: ReturnType<typeof createRemoteJWKSet> = undefined as any
@@ -5206,23 +5225,6 @@ app.get("/health", asyncHandler(async (_req, res) => {
   )
 }))
 
-
-app.all("/api/auth/*", authLimiter, (req, res, next) => {
-  if (!betterAuthHandler) {
-    return next(
-      new AppError(
-        "Authentication service is starting. Retry shortly.",
-        503
-      )
-    )
-  }
-
-  try {
-    betterAuthHandler(req, res)
-  } catch (error) {
-    next(error)
-  }
-})
 
 
 app.get("/", (req, res) => {
