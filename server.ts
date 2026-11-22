@@ -2388,6 +2388,119 @@ app.post("/api/bookings/:id/cancel", verifyToken, asyncHandler(async (req, res) 
   send(res, null, "Booking cancelled.")
 }))
 
+app.get("/api/owner/bookings", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const page = Math.max(
+    1,
+    Number(req.query.page ?? 1) || 1
+  )
+
+  const limit = Math.min(
+    100,
+    Math.max(1, Number(req.query.limit ?? 20) || 20)
+  )
+
+  const [items, total] = await Promise.all([
+    bookingsCollection()
+      .find({ ownerId: user.id })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .toArray(),
+
+    bookingsCollection().countDocuments({
+      ownerId: user.id,
+    }),
+  ])
+
+  send(res, {
+    items,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  })
+}))
+
+app.patch("/api/owner/bookings/:id/status", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
+  const user = currentUser(req)
+
+  const rawBody: unknown = req.body
+
+  if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+    fail("Invalid booking status request.")
+  }
+
+  const body = rawBody as AnyDoc
+  const statusInput = body.status
+
+  if (
+    statusInput !== "in_progress" &&
+    statusInput !== "completed" &&
+    statusInput !== "cancelled"
+  ) {
+    fail("Invalid booking status.")
+  }
+
+  const status = statusInput
+
+  const bookingId =
+    typeof req.params.id === "string" ? req.params.id : ""
+
+  const booking = await bookingById(bookingId)
+
+  if (booking.ownerId !== user.id) {
+    fail("You do not own this booking.", 403)
+  }
+
+  if (status === "in_progress" && booking.paymentStatus !== "paid") {
+    fail("Only paid bookings can be marked in progress.", 409)
+  }
+
+  if (
+    status === "completed" &&
+    !["in_progress", "confirmed"].includes(booking.bookingStatus)
+  ) {
+    fail("Only active paid bookings can be completed.", 409)
+  }
+
+  if (status === "cancelled" && booking.paymentStatus === "paid") {
+    fail("Paid booking cancellation requires admin refund handling.", 409)
+  }
+
+  await bookingsCollection().updateOne(
+    { _id: booking._id },
+    {
+      $set: {
+        bookingStatus: status,
+        updatedAt: now(),
+        ...(status === "completed" ? { completedAt: now() } : {}),
+      },
+    }
+  )
+
+  await notify(
+    booking.customerId,
+    "booking_status",
+    "Rental status updated",
+    `Your ${booking.equipmentName} rental is now ${status.replace("_", " ")}.`
+  )
+
+  const updatedBooking = await bookingsCollection().findOne({
+    _id: booking._id,
+  })
+
+  send(
+    res,
+    updatedBooking,
+    "Booking status updated."
+  )
+}))
+
+
 
 app.get("/health", asyncHandler(async (_req, res) => {
   await db.command({ ping: 1 });
