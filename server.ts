@@ -1469,32 +1469,29 @@ app.get(
 )
 
 
-// 1. Create new equipment
 app.post("/api/equipment", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
-  const rawBody: unknown = req.body;
+  const rawBody: unknown = req.body
 
   if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
-    fail("Invalid equipment data.");
+    fail("Invalid equipment data.")
   }
 
-  const body = rawBody as AnyDoc;
+  const body = rawBody as AnyDoc
 
-  const rawLocation: unknown = body.location;
+  const rawLocation: unknown = body.location
 
   if (!rawLocation || typeof rawLocation !== "object" || Array.isArray(rawLocation)) {
-    fail("Equipment location is required.");
+    fail("Equipment location is required.")
   }
 
-  const locationInput = rawLocation as AnyDoc;
+  const locationInput = rawLocation as AnyDoc
 
-  // Validate description
-  const description = typeof body.description === "string" ? body.description.trim() : "";
+  const description = typeof body.description === "string" ? body.description.trim() : ""
 
   if (description.length < 20 || description.length > 5000) {
-    fail("Description must be between 20 and 5000 characters.");
+    fail("Description must be between 20 and 5000 characters.")
   }
 
-  // Validate category
   const categories = [
     "Construction Equipment",
     "Photography Equipment",
@@ -1503,40 +1500,39 @@ app.post("/api/equipment", verifyToken, verifyOwner, asyncHandler(async (req, re
     "Electronics",
     "Event Equipment",
     "Other",
-  ];
+  ]
 
   if (!categories.includes(body.category)) {
-    fail("Invalid equipment category.");
+    fail("Invalid equipment category.")
   }
 
 
-  const city = typeof locationInput.city === "string" ? locationInput.city.trim() : "";
-  const address = typeof locationInput.address === "string" ? locationInput.address.trim() : "";
+  const city = typeof locationInput.city === "string" ? locationInput.city.trim() : ""
+  const address = typeof locationInput.address === "string" ? locationInput.address.trim() : ""
 
   const country = locationInput.country === undefined
     ? "Bangladesh"
     : typeof locationInput.country === "string"
       ? locationInput.country.trim()
-      : "";
+      : ""
 
-  if (city.length < 2 || city.length > 100) fail("Invalid city.");
-  if (address.length < 3 || address.length > 250) fail("Invalid address.");
-  if (country.length < 2 || country.length > 100) fail("Invalid country.");
+  if (city.length < 2 || city.length > 100) fail("Invalid city.")
+  if (address.length < 3 || address.length > 250) fail("Invalid address.")
+  if (country.length < 2 || country.length > 100) fail("Invalid country.")
 
-  // Validate coordinates
-  const latitude = locationInput.latitude;
-  const longitude = locationInput.longitude;
+
+  const latitude = locationInput.latitude
+  const longitude = locationInput.longitude
 
   if (latitude !== undefined && (typeof latitude !== "number" || !Number.isFinite(latitude))) {
-    fail("Invalid latitude.");
+    fail("Invalid latitude.")
   }
 
   if (longitude !== undefined && (typeof longitude !== "number" || !Number.isFinite(longitude))) {
-    fail("Invalid longitude.");
+    fail("Invalid longitude.")
   }
 
-  // Validate rental price
-  const rentalPrice = body.rentalPrice;
+  const rentalPrice = body.rentalPrice
 
   if (
     typeof rentalPrice !== "number" ||
@@ -1544,96 +1540,91 @@ app.post("/api/equipment", verifyToken, verifyOwner, asyncHandler(async (req, re
     rentalPrice <= 0 ||
     rentalPrice > 100000000
   ) {
-    fail("Invalid rental price.");
+    fail("Invalid rental price.")
   }
 
-  // Validate rental type
   if (!["daily", "weekly", "monthly"].includes(body.rentalType)) {
-    fail("Invalid rental type.");
+    fail("Invalid rental type.")
   }
 
-  // Validate available quantity
-  const availableQuantity = body.availableQuantity;
 
+  const availableQuantity = body.availableQuantity
   if (
     !Number.isInteger(availableQuantity) ||
     availableQuantity < 1 ||
     availableQuantity > 10000
   ) {
-    fail("Available quantity must be between 1 and 10000.");
+    fail("Available quantity must be between 1 and 10000.")
   }
 
-  const condition = body.condition;
+  const condition = body.condition
 
   if (!["New", "Like New", "Good", "Fair"].includes(condition)) {
-    fail("Invalid equipment condition.");
+    fail("Invalid equipment condition.")
   }
 
-  // Validate brand and model
   if (body.brand !== undefined && typeof body.brand !== "string") {
-    fail("Invalid brand.");
+    fail("Invalid brand.")
   }
 
   if (body.model !== undefined && typeof body.model !== "string") {
-    fail("Invalid model.");
+    fail("Invalid model.")
   }
 
-  const brand = typeof body.brand === "string" ? body.brand.trim() : "";
-  const model = typeof body.model === "string" ? body.model.trim() : "";
+  const brand = typeof body.brand === "string" ? body.brand.trim() : ""
+  const model = typeof body.model === "string" ? body.model.trim() : ""
 
   if (brand.length > 100 || model.length > 100) {
-    fail("Brand and model must not exceed 100 characters.");
+    fail("Brand and model must not exceed 100 characters.")
   }
 
   const isValidUrl = (value: unknown): value is string => {
-    if (typeof value !== "string") return false;
+    if (typeof value !== "string") return false
 
     try {
-      new URL(value);
-      return true;
+      new URL(value)
+      return true
     } catch {
-      return false;
+      return false
     }
   };
 
   if (!isValidUrl(body.image) || body.image.length > 2000) {
-    fail("A valid equipment image URL is required.");
+    fail("A valid equipment image URL is required.")
   }
 
   if (body.gallery !== undefined && !Array.isArray(body.gallery)) {
-    fail("Gallery must be an array.");
+    fail("Gallery must be an array.")
   }
 
-  const gallery = Array.isArray(body.gallery) ? body.gallery : [];
+  const gallery = Array.isArray(body.gallery) ? body.gallery : []
 
   if (gallery.length > 10 || !gallery.every(isValidUrl)) {
-    fail("Gallery can contain up to 10 valid image URLs.");
+    fail("Gallery can contain up to 10 valid image URLs.")
   }
 
   if (body.rentalTerms !== undefined && typeof body.rentalTerms !== "string") {
-    fail("Invalid rental terms.");
+    fail("Invalid rental terms.")
   }
 
   const rentalTerms = typeof body.rentalTerms === "string"
     ? body.rentalTerms.trim()
-    : "Please handle the equipment carefully and return it on time.";
+    : "Please handle the equipment carefully and return it on time."
 
   if (rentalTerms.length > 4000) {
-    fail("Rental terms must not exceed 4000 characters.");
+    fail("Rental terms must not exceed 4000 characters.")
   }
 
-  // Get logged-in owner
   const user = currentUser(req);
 
-  // Create geographical coordinates
+
   const geo = latitude !== undefined && longitude !== undefined
     ? {
       type: "Point",
       coordinates: [longitude, latitude],
     }
-    : undefined;
+    : undefined
 
-  // Prepare equipment record
   const record = {
     name,
     description,
@@ -1669,7 +1660,6 @@ app.post("/api/equipment", verifyToken, verifyOwner, asyncHandler(async (req, re
     updatedAt: now(),
   };
 
-  // Save equipment in MongoDB
   const result = await equipmentCollection().insertOne(record);
 
   send(
@@ -1677,16 +1667,15 @@ app.post("/api/equipment", verifyToken, verifyOwner, asyncHandler(async (req, re
     { ...record, _id: result.insertedId },
     "Equipment submitted for admin approval.",
     201
-  );
-}));
+  )
+}))
 
 
-// 2. Get all equipment belonging to the logged-in owner
 app.get("/api/owner/equipment", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
-  const user = currentUser(req);
+  const user = currentUser(req)
 
-  const page = Math.max(1, Number(req.query.page ?? 1) || 1);
-  const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 20) || 20));
+  const page = Math.max(1, Number(req.query.page ?? 1) || 1)
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 20) || 20))
 
   const [items, total] = await Promise.all([
     equipmentCollection()
@@ -1697,7 +1686,7 @@ app.get("/api/owner/equipment", verifyToken, verifyOwner, asyncHandler(async (re
       .toArray(),
 
     equipmentCollection().countDocuments({ ownerId: user.id }),
-  ]);
+  ])
 
   send(res, {
     items,
@@ -1707,11 +1696,10 @@ app.get("/api/owner/equipment", verifyToken, verifyOwner, asyncHandler(async (re
       total,
       totalPages: Math.ceil(total / limit),
     },
-  });
-}));
+  })
+}))
 
 
-// 3. Get a specific equipment belonging to the logged-in owner
 app.get("/api/owner/equipment/:id", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
   const user = currentUser(req);
   const equipmentId =
@@ -1727,7 +1715,328 @@ app.get("/api/owner/equipment/:id", verifyToken, verifyOwner, asyncHandler(async
   }
 
   send(res, item);
-}));
+}))
+
+
+
+app.patch("/api/equipment/:id", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+  const equipmentId =
+    typeof req.params.id === "string" ? req.params.id : ""
+
+  const id = asObjectId(equipmentId, "equipment id")
+
+  const existing = await equipmentCollection().findOne({
+    _id: id,
+    ownerId: user.id,
+  })
+
+  if (!existing) {
+    fail("Equipment not found or not owned by you.", 404)
+  }
+
+  const rawBody: unknown = req.body
+
+  if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+    fail("Invalid equipment data.")
+  }
+
+  const body = rawBody as AnyDoc
+
+  const update: AnyDoc = {
+    updatedAt: now(),
+    status: "pending",
+  }
+
+  if (body.name !== undefined) {
+    if (typeof body.name !== "string") {
+      fail("Invalid equipment name.")
+    }
+
+    const name = body.name.trim()
+
+    if (name.length < 3 || name.length > 120) {
+      fail("Equipment name must be between 3 and 120 characters.")
+    }
+
+    update.name = name
+  }
+
+  if (body.description !== undefined) {
+    if (typeof body.description !== "string") {
+      fail("Invalid equipment description.")
+    }
+
+    const description = body.description.trim()
+
+    if (description.length < 20 || description.length > 5000) {
+      fail("Description must be between 20 and 5000 characters.")
+    }
+
+    update.description = description
+  }
+
+  if (body.category !== undefined) {
+    const categories = [
+      "Construction Equipment",
+      "Photography Equipment",
+      "Vehicles & Transportation",
+      "Agriculture Equipment",
+      "Electronics",
+      "Event Equipment",
+      "Other",
+    ];
+
+    if (!categories.includes(body.category)) {
+      fail("Invalid equipment category.")
+    }
+
+    update.category = body.category
+  }
+
+  // Validate and update location
+  if (body.location !== undefined) {
+    const rawLocation: unknown = body.location
+    if (
+      !rawLocation ||
+      typeof rawLocation !== "object" ||
+      Array.isArray(rawLocation)
+    ) {
+      fail("Invalid equipment location.")
+    }
+
+    const location = rawLocation as AnyDoc
+
+    const city =
+      typeof location.city === "string" ? location.city.trim() : ""
+
+    const address =
+      typeof location.address === "string" ? location.address.trim() : ""
+
+    const country =
+      location.country === undefined
+        ? "Bangladesh"
+        : typeof location.country === "string"
+          ? location.country.trim()
+          : ""
+
+    if (city.length < 2 || city.length > 100) {
+      fail("Invalid city.")
+    }
+
+    if (address.length < 3 || address.length > 250) {
+      fail("Invalid address.")
+    }
+
+    if (country.length < 2 || country.length > 100) {
+      fail("Invalid country.")
+    }
+
+    const latitude = location.latitude
+    const longitude = location.longitude
+
+    if (
+      latitude !== undefined &&
+      (typeof latitude !== "number" || !Number.isFinite(latitude))
+    ) {
+      fail("Invalid latitude.")
+    }
+
+    if (
+      longitude !== undefined &&
+      (typeof longitude !== "number" || !Number.isFinite(longitude))
+    ) {
+      fail("Invalid longitude.")
+    }
+
+    const updatedLocation: AnyDoc = {
+      city,
+      address,
+      country,
+    };
+
+    if (latitude !== undefined) updatedLocation.latitude = latitude
+    if (longitude !== undefined) updatedLocation.longitude = longitude
+
+    if (latitude !== undefined && longitude !== undefined) {
+      updatedLocation.geo = {
+        type: "Point",
+        coordinates: [longitude, latitude],
+      }
+    }
+
+    update.location = updatedLocation
+  }
+
+  if (body.rentalPrice !== undefined) {
+    if (
+      typeof body.rentalPrice !== "number" ||
+      !Number.isFinite(body.rentalPrice) ||
+      body.rentalPrice <= 0 ||
+      body.rentalPrice > 100000000
+    ) {
+      fail("Invalid rental price.")
+    }
+
+    update.rentalPrice = body.rentalPrice
+  }
+
+  if (body.rentalType !== undefined) {
+    if (!["daily", "weekly", "monthly"].includes(body.rentalType)) {
+      fail("Invalid rental type.")
+    }
+
+    update.rentalType = body.rentalType
+  }
+
+  if (body.availableQuantity !== undefined) {
+    if (
+      !Number.isInteger(body.availableQuantity) ||
+      body.availableQuantity < 1 ||
+      body.availableQuantity > 10000
+    ) {
+      fail("Invalid available quantity.")
+    }
+
+    update.availableQuantity = body.availableQuantity
+  }
+
+  if (body.condition !== undefined) {
+    if (!["New", "Like New", "Good", "Fair"].includes(body.condition)) {
+      fail("Invalid equipment condition.")
+    }
+
+    update.condition = body.condition
+  }
+
+  if (body.brand !== undefined) {
+    if (typeof body.brand !== "string") {
+      fail("Invalid brand.")
+    }
+
+    const brand = body.brand.trim()
+
+    if (brand.length > 100) {
+      fail("Brand must not exceed 100 characters.")
+    }
+
+    update.brand = brand
+  }
+
+  if (body.model !== undefined) {
+    if (typeof body.model !== "string") {
+      fail("Invalid model.")
+    }
+
+    const model = body.model.trim()
+
+    if (model.length > 100) {
+      fail("Model must not exceed 100 characters.")
+    }
+
+    update.model = model
+  }
+
+  const isValidUrl = (value: unknown): value is string => {
+    if (typeof value !== "string") return false
+
+    try {
+      new URL(value)
+      return true
+    } catch {
+      return false
+    }
+  };
+
+  if (body.image !== undefined) {
+    if (!isValidUrl(body.image) || body.image.length > 2000) {
+      fail("Invalid equipment image URL.")
+    }
+
+    update.image = body.image
+  }
+
+  if (body.gallery !== undefined) {
+    if (!Array.isArray(body.gallery)) {
+      fail("Gallery must be an array.")
+    }
+
+    if (body.gallery.length > 10 || !body.gallery.every(isValidUrl)) {
+      fail("Gallery can contain up to 10 valid image URLs.")
+    }
+
+    update.gallery = body.gallery
+  }
+
+  if (body.rentalTerms !== undefined) {
+    if (typeof body.rentalTerms !== "string") {
+      fail("Invalid rental terms.");
+    }
+
+    const rentalTerms = body.rentalTerms.trim()
+
+    if (rentalTerms.length > 4000) {
+      fail("Rental terms must not exceed 4000 characters.")
+    }
+
+    update.rentalTerms = rentalTerms
+  }
+
+  await equipmentCollection().updateOne(
+    { _id: id, ownerId: user.id },
+    { $set: update }
+  );
+
+  const updatedItem = await equipmentCollection().findOne({
+    _id: id,
+    ownerId: user.id,
+  });
+
+  send(
+    res,
+    updatedItem,
+    "Equipment updated and resubmitted for approval."
+  )
+}))
+
+
+app.delete("/api/equipment/:id", verifyToken, verifyOwner, asyncHandler(async (req, res) => {
+  const user = currentUser(req);
+
+  const equipmentId =
+    typeof req.params.id === "string" ? req.params.id : ""
+
+  const id = asObjectId(equipmentId, "equipment id")
+
+  const activeBookings = await bookingsCollection().countDocuments({
+    equipmentId: id,
+    bookingStatus: {
+      $in: ["confirmed", "in_progress", "pending_payment"],
+    },
+  })
+
+  if (activeBookings) {
+    fail("Equipment with active bookings cannot be deleted.", 409);
+  }
+
+
+  const result = await equipmentCollection().deleteOne({
+    _id: id,
+    ownerId: user.id,
+  })
+
+  if (!result.deletedCount) {
+    fail("Equipment not found or not owned by you.", 404);
+  }
+
+  await favoritesCollection().deleteMany({
+    equipmentId: id,
+  })
+
+  send(res, null, "Equipment deleted.");
+}))
+
 
 
 
