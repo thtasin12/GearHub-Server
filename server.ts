@@ -9,6 +9,7 @@ import dotenv from "dotenv";
 import {
   MongoClient,
   ObjectId,
+  type ClientSession,
   type Db,
   type Collection,
   type Document,
@@ -33,6 +34,7 @@ import cron from "node-cron"
 dotenv.config();
 
 let db!: Db;
+let transactionsSupported = false;
 
 
 
@@ -658,6 +660,11 @@ const addMinutes = (date: Date, minutes: number) =>
 const isRole = (value: unknown): value is Role =>
   value === "customer" || value === "owner" || value === "admin";
 
+const isDuplicateKeyError = (error: unknown) =>
+  typeof error === "object" &&
+  error !== null &&
+  Number((error as AnyDoc).code) === 11000;
+
 const isValidDate = (value: unknown): value is string =>
   typeof value === "string" && !Number.isNaN(Date.parse(value));
 
@@ -684,6 +691,7 @@ const conversationsCollection = () => getCollection("conversations")
 const messagesCollection = () => getCollection("messages")
 const handoversCollection = () => getCollection("handovers")
 const extensionsCollection = () => getCollection("extensions")
+const ownerApplicationsCollection = () => getCollection("ownerApplications")
 
 const send = (
   res: Response,
@@ -5052,6 +5060,619 @@ app.get("/api/bookings/:id/tracking", verifyToken, asyncHandler(async (req, res)
 }))
 
 
+// ─── Owner Application System ────────────────────────────────────────────────
+
+type OwnerApplicationStatus = "pending" | "approved" | "rejected"
+
+// POST /api/owner-applications — customer submits an application
+app.post(
+  "/api/owner-applications",
+  verifyToken,
+  verifyRenter,
+  asyncHandler(async (req, res) => {
+    const user = currentUser(req)
+
+    // Validate request body
+    const rawBody: unknown = req.body
+
+    if (!rawBody || typeof rawBody !== "object" || Array.isArray(rawBody)) {
+      fail("Invalid application data.")
+    }
+
+    const body = rawBody as Record<string, unknown>
+
+    const phone = typeof body.phone === "string" ? body.phone.trim() : ""
+
+    if (phone.length < 6 || phone.length > 30) {
+      fail("Phone number must be between 6 and 30 characters.")
+    }
+
+    const address = typeof body.address === "string" ? body.address.trim() : ""
+
+    if (address.length < 5 || address.length > 500) {
+      fail("Address must be between 5 and 500 characters.")
+    }
+
+    const reason = typeof body.reason === "string" ? body.reason.trim() : ""
+
+    if (reason.length < 20 || reason.length > 2000) {
+      fail("Reason must be between 20 and 2000 characters.")
+    }
+
+    // Prevent duplicate pending applications
+    const existing = await ownerApplicationsCollection().findOne({
+      applicantId: user.id,
+      status: "pending",
+    })
+
+    if (existing) {
+      fail(
+        "You already have a pending owner application.",
+        409,
+        "DUPLICATE_APPLICATION"
+      )
+    }
+
+    const application = {
+      applicantId: user.id,
+      applicantEmail: user.email,
+      applicantName: user.name,
+      phone,
+      address,
+      reason,
+      status: "pending" as OwnerApplicationStatus,
+      createdAt: now(),
+      updatedAt: now(),
+    }
+
+    const result = await ownerApplicationsCollection()
+      .insertOne(application)
+      .catch((error: unknown) => {
+        if (isDuplicateKeyError(error)) {
+          fail(
+            "You already have a pending owner application.",
+            409,
+            "DUPLICATE_APPLICATION"
+          )
+        }
+
+        throw error
+      })
+
+    send(
+      res,
+      { ...application, _id: result.insertedId },
+      "Owner application submitted successfully.",
+      201
+    )
+  })
+)
+
+// GET /api/owner-applications/me — authenticated user's latest application
+app.get(
+  "/api/owner-applications/me",
+  verifyToken,
+  asyncHandler(async (req, res) => {
+    const user = currentUser(req)
+
+    const application = await ownerApplicationsCollection().findOne(
+      { applicantId: user.id },
+      { sort: { createdAt: -1 } }
+    )
+
+    send(res, application ?? null)
+  })
+)
+
+// GET /api/admin/owner-applications — admin lists applications with optional status filter
+app.get(
+  "/api/admin/owner-applications",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (req, res) => {
+    const rawStatus: unknown = req.query.status
+
+    const status =
+      typeof rawStatus === "string" ? rawStatus.trim() : ""
+
+    const filter: AnyDoc = {}
+
+    if (status) {
+      const allowedStatuses: OwnerApplicationStatus[] = [
+        "pending",
+        "approved",
+        "rejected",
+      ]
+
+      if (!allowedStatuses.includes(status as OwnerApplicationStatus)) {
+        fail("Invalid application status filter.")
+      }
+
+      filter.status = status
+    }
+
+    const page = Math.max(1, Number(req.query.page ?? 1) || 1)
+    const limit = Math.min(
+      100,
+      Math.max(1, Number(req.query.limit ?? 20) || 20)
+    )
+
+    const [items, total] = await Promise.all([
+      ownerApplicationsCollection()
+        .find(filter)
+        .sort({ createdAt: -1 })
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .toArray(),
+
+      ownerApplicationsCollection().countDocuments(filter),
+    ])
+
+    send(res, {
+      items,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    })
+  })
+)
+
+const ownerApplicantIdentity = (application: AnyDoc) => {
+  const applicantId =
+    typeof application.applicantId === "string"
+      ? application.applicantId.trim()
+      : ""
+
+  const applicantEmail =
+    typeof application.applicantEmail === "string"
+      ? application.applicantEmail.trim().toLowerCase()
+      : ""
+
+  return { applicantId, applicantEmail }
+}
+
+const isOwnOwnerApplication = (
+  application: AnyDoc,
+  actor: AuthUser
+) => {
+  const { applicantId, applicantEmail } = ownerApplicantIdentity(application)
+
+  return (
+    (applicantId !== "" && applicantId === actor.id) ||
+    (applicantEmail !== "" && applicantEmail === actor.email.toLowerCase())
+  )
+}
+
+const findOwnerApplicant = async (
+  application: AnyDoc,
+  session?: ClientSession
+) => {
+  const { applicantId, applicantEmail } = ownerApplicantIdentity(application)
+
+  if (!applicantId && !applicantEmail) {
+    return null
+  }
+
+  const options = session ? { session } : {}
+
+  // Better Auth stores the user's identifier in the string `_id` field.
+  // Older data may not have `_id` aligned with the JWT subject, so email is
+  // used as a fallback, mirroring the existing admin role-update endpoint.
+  if (applicantId) {
+    const byId = await userCollection().findOne(
+      { _id: applicantId } as AnyDoc,
+      options
+    )
+
+    if (byId) {
+      return byId
+    }
+  }
+
+  if (applicantEmail) {
+    return userCollection().findOne({ email: applicantEmail }, options)
+  }
+
+  return null
+}
+
+const loadReviewableOwnerApplication = async (
+  id: ObjectId,
+  actor: AuthUser,
+  session?: ClientSession
+) => {
+  const options = session ? { session } : {}
+
+  const application = await ownerApplicationsCollection().findOne(
+    { _id: id },
+    options
+  )
+
+  if (!application) {
+    return fail("Owner application not found.", 404)
+  }
+
+  const current = application as AnyDoc
+
+  if (current.status !== "pending") {
+    fail(
+      "This application has already been reviewed and cannot be changed.",
+      409,
+      "ALREADY_REVIEWED"
+    )
+  }
+
+  if (isOwnOwnerApplication(current, actor)) {
+    fail(
+      "You cannot approve your own owner application.",
+      403,
+      "SELF_APPROVAL"
+    )
+  }
+
+  const { applicantId } = ownerApplicantIdentity(current)
+
+  if (!applicantId) {
+    fail(
+      "The application is missing a valid applicant identifier.",
+      409,
+      "INVALID_APPLICANT"
+    )
+  }
+
+  const applicant = await findOwnerApplicant(current, session)
+
+  if (!applicant) {
+    return fail(
+      "The applicant account could not be found, so the application was not approved.",
+      409,
+      "APPLICANT_NOT_FOUND"
+    )
+  }
+
+  return { application: current, applicant }
+}
+
+const eligibleOwnerApplicantRoles = ["customer", "owner"] as const
+
+const eligibleOwnerApplicantRole = (applicant: AnyDoc): Role => {
+  const role = applicant.role
+
+  if (!isRole(role)) {
+    return fail(
+      "The applicant has a missing or invalid role, so the application was not approved.",
+      409,
+      "INVALID_APPLICANT_ROLE"
+    )
+  }
+
+  if (role === "admin") {
+    return fail(
+      "Administrator accounts cannot be promoted to owner.",
+      409,
+      "APPLICANT_ROLE_INELIGIBLE"
+    )
+  }
+
+  return role
+}
+
+const promoteOwnerApplicant = async (
+  applicant: AnyDoc,
+  timestamp: Date,
+  session?: ClientSession
+) => {
+  eligibleOwnerApplicantRole(applicant)
+
+  const result = await userCollection().updateOne(
+    {
+      _id: applicant._id,
+      role: { $in: [...eligibleOwnerApplicantRoles] },
+    },
+    {
+      $set: {
+        role: "owner",
+        updatedAt: timestamp,
+      },
+    },
+    session ? { session } : {}
+  )
+
+  if (!result.matchedCount) {
+    fail(
+      "The applicant's role is no longer eligible for promotion, so the application was not approved.",
+      409,
+      "APPLICANT_ROLE_INELIGIBLE"
+    )
+  }
+}
+
+const markOwnerApplicationApproved = async (
+  id: ObjectId,
+  reviewNote: string,
+  timestamp: Date,
+  session?: ClientSession
+) => {
+  const result = await ownerApplicationsCollection().updateOne(
+    {
+      _id: id,
+      status: "pending",
+    },
+    {
+      $set: {
+        status: "approved",
+        reviewNote,
+        reviewedAt: timestamp,
+        updatedAt: timestamp,
+      },
+    },
+    session ? { session } : {}
+  )
+
+  if (!result.matchedCount) {
+    fail(
+      "This application has already been reviewed and cannot be changed.",
+      409,
+      "ALREADY_REVIEWED"
+    )
+  }
+}
+
+const approveOwnerApplication = async (
+  id: ObjectId,
+  actor: AuthUser,
+  reviewNote: string
+) => {
+  const timestamp = now()
+
+  if (transactionsSupported) {
+    const session = mongoClient.startSession()
+
+    try {
+      await session.withTransaction(async () => {
+        const { applicant } = await loadReviewableOwnerApplication(
+          id,
+          actor,
+          session
+        )
+
+        await promoteOwnerApplicant(applicant, timestamp, session)
+        await markOwnerApplicationApproved(id, reviewNote, timestamp, session)
+      })
+    } finally {
+      await session.endSession()
+    }
+
+    return
+  }
+
+  // Standalone MongoDB does not support transactions. Promote the applicant
+  // before approving the application so an application can never become
+  // permanently approved while its applicant is still a customer.
+  const { applicant } = await loadReviewableOwnerApplication(id, actor)
+  const previousRole = eligibleOwnerApplicantRole(applicant)
+
+  await promoteOwnerApplicant(applicant, timestamp)
+
+  const rollbackPromotion = async (reason: string) => {
+    if (previousRole === "owner") {
+      return
+    }
+
+    try {
+      const result = await userCollection().updateOne(
+        {
+          _id: applicant._id,
+          role: "owner",
+        },
+        {
+          $set: {
+            role: previousRole,
+            updatedAt: now(),
+          },
+        }
+      )
+
+      if (!result.matchedCount) {
+        console.error("Owner approval rollback did not match the applicant:", {
+          applicationId: String(id),
+          reason,
+        })
+      }
+    } catch (error) {
+      console.error("Owner approval rollback failed:", {
+        applicationId: String(id),
+        reason,
+        error: error instanceof Error ? error.message : "Unknown error",
+      })
+    }
+  }
+
+  try {
+    await markOwnerApplicationApproved(id, reviewNote, timestamp)
+  } catch (error) {
+    let latest: AnyDoc | null = null
+
+    try {
+      latest = (await ownerApplicationsCollection().findOne({
+        _id: id,
+      })) as AnyDoc | null
+    } catch {
+      // If the final state cannot be read, keep the promotion. An owner with a
+      // pending application is recoverable; rolling back a completed approval
+      // would leave an approved application owned by a customer.
+      throw error
+    }
+
+    if (latest?.status === "approved") {
+      return
+    }
+
+    await rollbackPromotion(
+      latest?.status === "rejected"
+        ? "application was rejected concurrently"
+        : "application approval did not persist"
+    )
+
+    throw error
+  }
+}
+
+const notifyOwnerApplicationSafely = async (
+  applicationId: string,
+  userId: string,
+  type: string,
+  title: string,
+  message: string,
+  link: string
+) => {
+  try {
+    await notify(userId, type, title, message, link)
+  } catch (error) {
+    // Notification failures must never turn a committed approval into an error.
+    console.error("Owner application notification failed:", {
+      applicationId,
+      type,
+      error: error instanceof Error ? error.message : "Unknown error",
+    })
+  }
+}
+
+// PATCH /api/admin/owner-applications/:id — admin approves or rejects an application
+app.patch(
+  "/api/admin/owner-applications/:id",
+  verifyToken,
+  verifyAdmin,
+  asyncHandler(async (req, res) => {
+    const actor = currentUser(req)
+
+    const rawId: unknown = req.params.id
+
+    if (typeof rawId !== "string" || !rawId.trim()) {
+      fail("Invalid application ID.", 400, "INVALID_ID")
+    }
+
+    const id = asObjectId(rawId as string, "application id")
+
+    const rawBody: unknown = req.body
+
+    if (
+      !rawBody ||
+      typeof rawBody !== "object" ||
+      Array.isArray(rawBody)
+    ) {
+      fail("Invalid review data.")
+    }
+
+    const body = rawBody as Record<string, unknown>
+
+    const rawStatus: unknown = body.status
+    const allowedStatuses = ["approved", "rejected"] as const
+
+    if (
+      typeof rawStatus !== "string" ||
+      !allowedStatuses.includes(rawStatus as (typeof allowedStatuses)[number])
+    ) {
+      fail('Application status must be "approved" or "rejected".')
+    }
+
+    const newStatus = rawStatus as "approved" | "rejected"
+
+    const reviewNote =
+      typeof body.reviewNote === "string"
+        ? cleanText(body.reviewNote, 1000)
+        : ""
+
+    const application = await ownerApplicationsCollection().findOne({ _id: id })
+
+    if (!application) {
+      fail("Owner application not found.", 404)
+    }
+
+    const current = application as AnyDoc
+
+    // Prevent re-reviewing an already-reviewed application
+    if (current.status !== "pending") {
+      fail(
+        "This application has already been reviewed and cannot be changed.",
+        409,
+        "ALREADY_REVIEWED"
+      )
+    }
+
+    if (newStatus === "approved" && isOwnOwnerApplication(current, actor)) {
+      fail(
+        "You cannot approve your own owner application.",
+        403,
+        "SELF_APPROVAL"
+      )
+    }
+
+    const applicationId = String(id)
+    const { applicantId } = ownerApplicantIdentity(current)
+
+    if (newStatus === "approved") {
+      await approveOwnerApplication(id, actor, reviewNote)
+
+      await notifyOwnerApplicationSafely(
+        applicationId,
+        applicantId,
+        "application_approved",
+        "Owner application approved",
+        "Congratulations! Your owner application has been approved. You can now list equipment.",
+        "/dashboard/owner"
+      )
+    } else {
+      const result = await ownerApplicationsCollection().updateOne(
+        {
+          _id: id,
+          status: "pending",
+        },
+        {
+          $set: {
+            status: "rejected",
+            reviewNote,
+            reviewedAt: now(),
+            updatedAt: now(),
+          },
+        }
+      )
+
+      if (!result.matchedCount) {
+        fail(
+          "This application has already been reviewed and cannot be changed.",
+          409,
+          "ALREADY_REVIEWED"
+        )
+      }
+
+      await notifyOwnerApplicationSafely(
+        applicationId,
+        applicantId,
+        "application_rejected",
+        "Owner application rejected",
+        reviewNote
+          ? `Your owner application was rejected: ${reviewNote}`
+          : "Your owner application was not approved at this time.",
+        "/dashboard/customer"
+      )
+    }
+
+    const updated = await ownerApplicationsCollection().findOne({ _id: id })
+
+    send(
+      res,
+      updated,
+      `Application ${newStatus}.`
+    )
+  })
+)
+
+// ─── End Owner Application System ────────────────────────────────────────────
+
 app.use((_req, _res, next) => {
   next(new AppError("API endpoint not found.", 404, "NOT_FOUND"))
 })
@@ -5124,6 +5745,17 @@ async function createIndexes() {
     messagesCollection().createIndex({ conversationId: 1, createdAt: 1 }),
     handoversCollection().createIndex({ bookingId: 1, createdAt: 1 }),
     extensionsCollection().createIndex({ bookingId: 1, createdAt: -1 }),
+
+    ownerApplicationsCollection().createIndex({ applicantId: 1, createdAt: -1 }),
+    ownerApplicationsCollection().createIndex({ status: 1, createdAt: -1 }),
+    ownerApplicationsCollection().createIndex(
+      { applicantId: 1 },
+      {
+        unique: true,
+        partialFilterExpression: { status: "pending" },
+        name: "unique_pending_owner_application",
+      }
+    ),
 
     getCollection("processedStripeEvents").createIndex(
       { processedAt: 1 },
@@ -5251,6 +5883,11 @@ async function startServer() {
     db = mongoClient.db(env.MONGODB_DB_NAME)
 
     await db.command({ ping: 1 })
+
+    const topology = await db.admin().command({ hello: 1 })
+
+    transactionsSupported =
+      Boolean(topology.setName) || topology.msg === "isdbgrid"
 
     await initializeAuth()
 
