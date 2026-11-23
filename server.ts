@@ -1505,6 +1505,14 @@ app.post("/api/equipment", verifyToken, verifyOwner, asyncHandler(async (req, re
 
   const body = rawBody as AnyDoc
 
+  const name = typeof body.name === "string"
+    ? body.name.trim()
+    : ""
+
+  if (name.length < 3 || name.length > 120) {
+    fail("Equipment name must be between 3 and 120 characters.")
+  }
+
   const rawLocation: unknown = body.location
 
   if (!rawLocation || typeof rawLocation !== "object" || Array.isArray(rawLocation)) {
@@ -3896,7 +3904,7 @@ app.patch("/api/admin/equipment/:id", verifyToken, verifyAdmin, asyncHandler(asy
 
     update.name = name
   }
-  
+
   if ("description" in body) {
     const rawDescription: unknown = body.description
 
@@ -4673,7 +4681,7 @@ app.post("/api/bookings/:id/extensions", verifyToken, verifyRenter, asyncHandler
     Number(item.availableQuantity),
     booking._id
   )
-  
+
   const extra = calculateRental(
     Number(item.rentalPrice),
     item.rentalType as RentalType,
@@ -4681,7 +4689,7 @@ app.post("/api/bookings/:id/extensions", verifyToken, verifyRenter, asyncHandler
     newEndAt,
     Number(booking.requiredQuantity)
   )
-  
+
   const extension = {
     bookingId: booking._id,
     customerId: user.id,
@@ -4944,12 +4952,12 @@ app.post("/api/bookings/:id/handover", verifyToken, asyncHandler(async (req, res
 
   const photos: string[] = Array.isArray(rawPhotos)
     ? rawPhotos
-        .filter(
-          (value: unknown): value is string =>
-            typeof value === "string" &&
-            /^https:\/\//.test(value)
-        )
-        .slice(0, 8)
+      .filter(
+        (value: unknown): value is string =>
+          typeof value === "string" &&
+          /^https:\/\//.test(value)
+      )
+      .slice(0, 8)
     : []
 
   const record = {
